@@ -54,13 +54,29 @@ sudo mkdir -p "$mnt/dst/private/preboot/Cryptexes/OS" "$mnt/dst/private/preboot/
 sudo rsync -aH "$mnt/sys/" "$mnt/dst/private/preboot/Cryptexes/OS/"
 sudo rsync -aH "$mnt/app/" "$mnt/dst/private/preboot/Cryptexes/App/"
 
-# ignition_level=1 looks for the dyld cache here (ios-fuxi's SWEET addition).
-cache=$(find "$mnt/dst/private/preboot/Cryptexes/OS" -name 'dyld_shared_cache_arm64e' -print -quit || true)
+# dyld opens the shared cache by path: either /System/Library/Caches/com.apple.dyld/
+# or, on iOS 16, /System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/.
+# Give it both: a symlink for the cryptex mount point and a hard link at the
+# legacy path (no extra space). sudo: the cryptex files are root-only.
+echo "dyld caches on the three volumes:"
+sudo find "$mnt/os" "$mnt/sys" "$mnt/app" -name 'dyld_shared_cache*' -printf '  %p %s
+' 2>/dev/null | head -20 || true
+
+cache=$(sudo find "$mnt/dst" -name 'dyld_shared_cache_arm64e' -print -quit 2>/dev/null || true)
 if [ -n "$cache" ]; then
-	mkdir -p "$mnt/dst/System/Library/Caches/com.apple.dyld"
-	ln -f "$cache" "$mnt/dst/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e" || true
-	echo "dyld cache: $cache"
+	sudo mkdir -p "$mnt/dst/System/Library/Caches/com.apple.dyld"
+	sudo ln -f "$cache" "$mnt/dst/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e" || true
+	echo "dyld cache hard link: $cache -> /System/Library/Caches/com.apple.dyld/"
+else
+	echo "WARNING: no dyld_shared_cache_arm64e in the image" >&2
 fi
+
+# iOS 16 mounts the SystemOS cryptex at /System/Cryptexes/OS; here it lives
+# under /private/preboot, so point the well-known path at it.
+sudo mkdir -p "$mnt/dst/System/Cryptexes"
+sudo ln -sfn ../../private/preboot/Cryptexes/OS "$mnt/dst/System/Cryptexes/OS"
+sudo ln -sfn ../../private/preboot/Cryptexes/App "$mnt/dst/System/Cryptexes/App"
+ls -l "$mnt/dst/System/Cryptexes/"
 
 sync
 sudo umount "$mnt/dst" || hdiutil detach "$mnt/dst" -force
