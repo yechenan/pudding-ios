@@ -1,0 +1,27 @@
+pudding-ios — iOS 16.7.16 on the Xiaomi 17 (pudding, SM8850)
+
+This repository contains only device-specific additions: kernel patches,
+scripts, measurement notes and CI definitions. It does not redistribute
+upstream code; the build fetches it from the projects below.
+
+Upstream projects and their licenses
+------------------------------------
+- ShueiTsuki/data-a-live — Xiaomi 17 Pro (pandora) port. Kernel patches and
+  the kernel-side drivers are APSL-2.0 (the license of Apple's xnu they patch);
+  tools and documentation are MIT.
+- dipa-studio/ios-sweet — the original XNU-on-Qualcomm port this lineage
+  descends from.
+- UniXNU/UniXNU — 4 KiB page support, NativeAdreno, NativeMetal, ArmSmmu4K.
+  BSD-2-Clause-Patent.
+- blacktop/darwin-xnu-build — the macOS build script used by CI.
+- Apple Inc. — XNU kernel sources (APSL-2.0).
+
+Not distributed here
+--------------------
+- Apple system files: IPSWs, SDKs, dyld shared caches, kernelcaches.
+- Phone firmware and partition dumps.
+- Device-unique data (IMEI, calibration).
+
+Users obtain these from their own device and from Apple's public servers.
+"iOS", "iPhone", "XNU" and "Apple" are named only to describe what the code
+works with; this project is not affiliated with or endorsed by Apple.

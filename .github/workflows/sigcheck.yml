@@ -1,0 +1,73 @@
+name: sigcheck
+
+# Dump /sbin/launchd's code signature from the IPSW's OS image: the fields that
+# decide whether a 4 KiB-page kernel can validate it (and why it gets CS_KILLED).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  launchd:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Download the 16.7.16 IPSW for iPhone10,3
+        run: |
+          URL=$(curl -s --retry 3 https://api.ipsw.me/v4/device/iPhone10,3?type=ipsw | \
+            python3 -c "import sys,json;d=json.load(sys.stdin);print([f['url'] for f in d['firmwares'] if f['version']=='16.7.16'][0])")
+          echo "ipsw: $URL"
+          curl -L --retry 3 -o /tmp/ios.ipsw "$URL"
+
+      - name: Mount the OS image
+        run: |
+          mkdir -p /tmp/dmg
+          unzip -o -j /tmp/ios.ipsw '087-86698-044.dmg' -d /tmp/dmg
+          hdiutil attach -readonly -nobrowse -noverify -mountpoint /tmp/os /tmp/dmg/087-86698-044.dmg
+          ls -l /tmp/os/sbin/launchd
+          shasum -a 256 /tmp/os/sbin/launchd
+          codesign -dvvv /tmp/os/sbin/launchd 2>&1 | sed -n '1,30p' || true
+
+      - name: Parse LC_CODE_SIGNATURE
+        run: |
+          cp /tmp/os/sbin/launchd /tmp/launchd
+          python3 - <<'PYEOF'
+          import struct, hashlib
+          d = open('/tmp/launchd','rb').read()
+          magic, cputype, cpusub, ft, ncmds, sizeofcmds, flags, r = struct.unpack_from('<IiIIIIII', d, 0)
+          print('mach-o magic %08x cputype %d flags %08x ncmds %d' % (magic, cputype, flags, ncmds))
+          off = 32
+          for _ in range(ncmds):
+              cmd, sz = struct.unpack_from('<II', d, off)
+              if cmd == 0x1d:
+                  dataoff, datasize = struct.unpack_from('<II', d, off + 8)
+                  print('LC_CODE_SIGNATURE at %d size %d' % (dataoff, datasize))
+                  sb_magic, sb_len, sb_count = struct.unpack_from('>III', d, dataoff)
+                  print('superblob magic %08x len %d count %d' % (sb_magic, sb_len, sb_count))
+                  for i in range(sb_count):
+                      typ, boff = struct.unpack_from('>II', d, dataoff + 12 + i * 8)
+                      if typ != 0:
+                          continue
+                      cd = dataoff + boff
+                      (cd_magic, cd_len, cd_ver, cd_flags, cd_hashOff, cd_identOff,
+                       cd_nSpecial, cd_nCode, cd_limit, cd_hashSize, cd_hashType,
+                       cd_platform, cd_pageSize, cd_spare2) = struct.unpack_from('>IIIIIIIIIBBBBI', d, cd)
+                      print('CD magic %08x version %x flags %x' % (cd_magic, cd_ver, cd_flags))
+                      print('  hashType %d hashSize %d pageSize 2^%d' % (cd_hashType, cd_hashSize, cd_pageSize))
+                      print('  nCodeSlots %d codeLimit %d nSpecialSlots %d' % (cd_nCode, cd_limit, cd_nSpecial))
+                      if cd_ver >= 0x20100:
+                          print('  scatterOffset %d' % struct.unpack_from('>I', d, cd + 44)[0])
+                      if cd_ver >= 0x20200:
+                          print('  codeLimit64 %d' % struct.unpack_from('>Q', d, cd + 56)[0])
+                      ident = d[cd + cd_identOff: d.index(b'\0', cd + cd_identOff)].decode()
+                      print('  identifier %s' % ident)
+                      blob = d[cd: cd + cd_len]
+                      print('  cdhash sha1   %s' % hashlib.sha1(blob).hexdigest())
+                      print('  cdhash sha256 %s' % hashlib.sha256(blob).hexdigest())
+                      break
+                  break
+              off += sz
+          PYEOF
+
+      - name: Detach
+        if: always()
+        run: hdiutil detach /tmp/os || true

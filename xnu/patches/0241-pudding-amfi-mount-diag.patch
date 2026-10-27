@@ -1,0 +1,30 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -278,6 +278,11 @@
+ {
+ 	mount_t mp = vnode_mount(vp);
+ 	*cs_flags |= CS_SIGNED;
++	if (sweet_amfi_debug) {
++		printf("SWEETAMFI vp %p mp %p vfs 0x%x rootfs %d cs 0x%x", vp, mp,
++		    mp ? vfs_flags(mp) : 0,
++		    mp ? !!(vfs_flags(mp) & MNT_ROOTFS) : 0, *cs_flags);
++	}
+ 	if (mp != NULL && (vfs_flags(mp) & MNT_ROOTFS)) {
+ 		*cs_flags |= CS_PLATFORM_BINARY;
+ 	}
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7512,6 +7512,11 @@
+ 	}
+ #endif /* XNU_TARGET_OS_OSX */
+ 
++	if (sweet_amfi_debug) {
++		printf("SWEETCS %s ip_csflags 0x%x macret %d cserr %d
++", p->p_name,
++		    imgp->ip_csflags, imgp->ip_mac_return, imgp->ip_cs_error != OS_REASON_NULL);
++	}
+ 	/* If the code signature came through the image activation path, we skip the
+ 	 * taskgated / externally attached path. */
+ 	if (imgp->ip_csflags & CS_SIGNED) {

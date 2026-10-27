@@ -1,0 +1,84 @@
+name: rootfs
+
+# Build the iOS root filesystem image on a macOS runner: hdiutil reads Apple's
+# chunked-LZFSE restore images natively, which no Linux tool here can do.
+# The result is gzipped and split so it can be pulled down in parts.
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: iOS version to fetch for iPhone10,3 (16.7.16)
+        default: "16.7.16"
+      size:
+        description: HFSX image size
+        default: "16g"
+
+concurrency:
+  group: rootfs
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve IPSW URL
+        run: |
+          URL=$(curl -s --retry 3 https://api.ipsw.me/v4/device/iPhone10,3?type=ipsw | \
+            python3 -c "import sys,json; v='${{ inputs.version }}'; d=json.load(sys.stdin); \
+            print([f['url'] for f in d['firmwares'] if f['version']==v][0])")
+          echo "IPSW_URL=$URL" >> "$GITHUB_ENV"
+          echo "ipsw: $URL"
+
+      - name: Download IPSW
+        run: |
+          curl -L --retry 3 --retry-delay 5 -o /tmp/ios.ipsw "$IPSW_URL"
+          ls -lh /tmp/ios.ipsw
+
+      - name: Unpack the three DMGs
+        run: |
+          mkdir -p /tmp/dmg
+          unzip -o -j /tmp/ios.ipsw '*.dmg' -d /tmp/dmg
+          ls -lh /tmp/dmg
+
+      - name: Build the HFSX root image
+        run: |
+          chmod +x scripts/macos-rootfs.sh
+          bash scripts/macos-rootfs.sh /tmp/dmg /tmp/ios-root.img "${{ inputs.size }}"
+          ls -lh /tmp/ios-root.img
+
+      - name: Compress and split
+        run: |
+          gzip -1 -c /tmp/ios-root.img > /tmp/ios-root.img.gz
+          rm -f /tmp/ios-root.img
+          split -b 1800m /tmp/ios-root.img.gz /tmp/ios-root.part-
+          rm -f /tmp/ios-root.img.gz
+          ls -lh /tmp/ios-root.part-*
+          shasum -a 256 /tmp/ios-root.part-* > /tmp/ios-root.sha256   # macOS has no sha256sum
+          cat /tmp/ios-root.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-root
+          path: |
+            /tmp/ios-root.part-*
+            /tmp/ios-root.sha256
+          compression-level: 0
+          retention-days: 14
+
+      # Artifacts need auth to download; release assets are public, so the
+      # mirror (ghfast.top) can fetch them at several MB/s instead of 60 KB/s.
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="rootfs-${{ inputs.version }}"
+          gh release view "$tag" >/dev/null 2>&1 ||             gh release create "$tag" --title "iOS root ${{ inputs.version }}"               --notes "HFSX root image built on a macOS runner (parts + sha256)."
+          gh release upload "$tag" /tmp/ios-root.part-* /tmp/ios-root.sha256 --clobber
+          echo "https://github.com/$GITHUB_REPOSITORY/releases/tag/$tag"

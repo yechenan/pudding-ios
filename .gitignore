@@ -1,0 +1,11 @@
+# upstream checkouts (fetched by scripts/fetch-upstream.sh)
+/upstream/
+
+# local build output and device dumps
+/out/
+*.img
+*.dtb
+*.fdt
+*.ipsw
+*.log
+__pycache__/
