@@ -51,7 +51,7 @@ wsl -e bash -lc "cd /mnt/c/$(printf '%s' "$root" | sed 's|^/c/||') && bash tools
 	'$(printf '%s' "$out" | sed 's|^/c/|/mnt/c/|')/kernel.development.pandora' \
 	'$(printf '%s' "$adt" | sed 's|^/c/|/mnt/c/|')' \
 	'$(printf '%s' "$out" | sed 's|^/c/|/mnt/c/|')' \
-	'debug=0x0 serial=3 cpus=8 bootcpu=7 keepsyms=1 -v rd=ufsroot0 ufsrw=1 rootrw=1 pandora_touch=0 pandora_keys=0 pandora_reboot_after=$wait_s unentitled_ios_sim_launch=1 cs_enforcement_disable=1'" |
+	'debug=0x0 serial=3 cpus=8 bootcpu=7 keepsyms=1 -v rd=ufsroot0 ufsrw=1 rootrw=1 pandora_touch=0 pandora_keys=0 pandora_reboot_after=$wait_s pandora_logsecs=1 unentitled_ios_sim_launch=1 cs_enforcement_disable=1'" |
 	tail -1
 
 echo "== boot"
