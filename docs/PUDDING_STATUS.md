@@ -656,3 +656,38 @@ SpringBoard 不再有任何动作。
 
 顺带：这一轮 `Runtime corruption` 是 **0 条**（run1 也是 0，run0 是 327）——
 把 `/private/var/containers` 建出来之后，HFS 的 orphan 清理不再乱释放块了，卷的损坏问题自己消失了。
+
+### 03:00 run3：注入电源键/滑动对屏幕没有任何影响
+
+`pandora_selftest=900` 会依次注入电源键、上滑、音量键、控制中心、亮度拖动。这一轮全部执行了：
+
+```
+[900.185] PANDORA SELFTEST: display_off=0
+[900.187] PANDORA SELFTEST: power press
+[903.309] PANDORA SELFTEST: after power 1 display_off=0     ← 电源键没让屏幕熄灭
+[906.434] PANDORA SELFTEST: swipe up 562,2425 -> 562,1100
+[918.928] PANDORA SELFTEST: done
+```
+
+而屏幕缩略图在 132 s 到 1512 s 之间（包括 `start`/`power1`/`power2`/`swipeup`/`cc`/`bright`
+六张自检缩略图）**逐字节完全相同**。整轮仍然只有 7 次 present（最后一次在 836.2 s）。
+结论：836 s 之后 **SpringBoard 和 backboardd 都不再对输入或 UI 状态做出任何反应**。
+
+### 03:30 run4：加了进程表自省（0251/0252）
+
+`bsd/dev/pandora_selftest.c` 里加了 `pandora_ps=SECONDS` / `pandora_ps_every=SECONDS`，
+每 N 秒打印一次 `proc_iterate(PROC_ALLPROCLIST)` 的结果。第一版只到进程级：
+
+```
+[1000.185] PS p 55 1 2 backboardd
+[1000.186] PS p 25 1 2 SpringBoard
+[1000.186] PS p 1 0 2 launchd
+```
+
+`p_stat=2` 是 SRUN，只能看出"可运行"，分不清是阻塞还是空转 —— 所以第二版（0252）改成遍历
+`proc->p_uthlist` 里的每个 uthread，打印 `uu_arg[0..1]`（mach trap 的参数会存进这里）、
+`syscall_code`、`uu_wmesg`、`uu_wchan`。编译坑：`struct uthread` 和
+`TAILQ_ENTRY(uthread)` 需要 `#include <sys/user.h>`，否则是 incomplete type。
+
+正在跑的 run5 在 300 / 650 / 1000 / 1350 s 各打一次全线程表，用来对比
+"SpringBoard 起来之前/之后" 各自卡在哪个 mach 端口或内核等待上。
