@@ -59,6 +59,29 @@ diff --git a/bsd/vfs/vfs_conf.c b/bsd/vfs/vfs_conf.c
  
  #if MOCKFS
  	/* If we are configured for it, mockfs should always be the last standard entry (and thus the last FS we attempt mountroot with) */
+diff --git a/bsd/dev/pandora_files.c b/bsd/dev/pandora_files.c
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -28,6 +28,7 @@
+ extern int pandora_fw_read(uint64_t off, void *dst, uint64_t len);
+ extern vnode_t rootvnode;
+ extern int pandora_mkdir(const char *path, int mode);   /* bsd/vfs/vfs_syscalls.c (patch 0185) */
++extern int sweet_amfi_publish(void);                    /* iokit/Kernel/arm/SweetAMFI.cpp */
+ void pandora_files_init(void);
+ 
+ #define PF_MAX_FILE   (64u << 20)
+@@ -121,6 +122,11 @@
+ 		pf_sleep(500);
+ 	}
+ 	pf_sleep(2000);
++	/* Retry the AMFI service publication: the preboot shim attempts it at
++	 * ~0.2 s, possibly before IOKit's service root exists. */
++	if (sweet_amfi_publish() != 0) {
++		printf("PANDORA FILES: no AMFI service\n");
++	}
+ 	uint8_t blk[4096];
+ 	uint32_t n = 0;
+ 	if (rootvnode == NULLVP || pandora_fw_read(0, blk, sizeof(blk))) {
 diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
 --- a/bsd/vfs/vfs_syscalls.c
 +++ b/bsd/vfs/vfs_syscalls.c
