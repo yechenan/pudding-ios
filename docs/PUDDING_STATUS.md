@@ -161,5 +161,71 @@ HFSX 根上没有这类设备，所以返回 ENOTSUP(25)。
    这样 bindfs 的 `mount -P 1` 和 launchd 的 cookie 检查也有东西可查。
 
 顺带修了 `xnu.yml`：`cp xnu/patches/*.patch xnu/patches/*.sh` 在没有 `.sh` 时会让整轮 CI 失败
-（最近三次 xnu 运行都是这样挂的）。
+（最近三次 xnu 运行都是这样挂的）。另外 step 3 只拷 `*.patch`，漏掉了
+`0020-stage-bearssl.sh`（它把 BearSSL 装进 `libkern/crypto/sweet_bearssl`），
+`libkern/crypto` 全部编译失败也是它。
+
+### 2026-10-28 验证：preboot 和 keybag 都过了
+
+同一版内核（run 40635027360）两次 boot 的结果：
+
+**第一版 ADT**：preboot 三个阶段全部按预期走通，ignition 推进到下一步：
+
+```
+preboot: mounting preboot
+preboot: preboot device: /dev/ufsroot0          ← fsctl 'J',80 由 shim 回答
+preboot: preboot mount point: /private/preboot   ← sysctl edt_fstab 由 shim 提供
+preboot: preboot already mounted: …              ← apfs vfs 回 EBUSY，走了 already 分支
+cryptex1 sniff: detecting cryptex1 directory
+cryptex1 sniff: ignition failed: 8               ← 新的坎：cryptex1 目录里没有东西
+ignition disabled
+```
+
+ignition 失败仍然不致命，launchd 继续；接着 keybagd 因为 `systembag.kb` 是空文件、
+MKB 解析不出字典而走 `systembag.kb.writing` 兜底失败（`Unable to load keybag with No Crypto: -7`）。
+
+**第二版 ADT（加了固件包）**：反汇编 `MobileKeyBag` 的 `_KBLoadSystemKeyBag` 看清了格式 ——
+`systembag.kb` 是 **binary plist 字典**，只要求字典里 `KeyBagKeys` 是一项 data
+（`_getData` 非空即可），`_load_binary_dict` 用 CFPropertyList 解析。于是用
+`mkfwpack.py` 做了 2 MiB 固件包（`files.txt` + 78 字节的
+`{"KeyBagVersion":3,"KeyBagKeys":<空 data>}`），`pinfile create/rawwrite` 钉住后
+`mkadt_pandora.py --fw-extents` 写进 ADT。结果：
+
+```
+PANDORA FILES: systembag.kb -> /private/var/keybags/systembag.kb (78 bytes)
+MKB_INIT: System Keybag loaded
+****** DONE MKB_INIT ****
+```
+
+keybag 不再是墙，重启消失，boot 直接推进到真正的用户态早期流程：
+`usermanagerd`（建 501 session、99/199 号 persona）、`auearlyboot`、`tzinit`、
+`sysstatuscheck`、`prng_seedctl`、`launchd_cache_loader` ……
+
+**当前卡点：AMFI 的 IOKit 接口**
+
+```
+exec launchd_cache_loader
+Code: /System/Library/xpc/launchd.plist Sig: /System/Library/xpc/launchd.plist.sig
+abort: Unable to find AMFI
+pid 21 exited … description Unable to find AMFI
+PANDORA: restart type 4        ← kPEPanicRestartCPU，即 panic
+```
+
+`launchd_cache_loader` 要
+`IOServiceGetMatchingService("AppleMobileFileIntegrity")` +
+`IOServiceOpen("AppleMobileFileIntegrityUserClient")` 去装 trust cache；
+SWEET 的 `bsd/kern/sweet_amfi.c` 只实现了内核侧的 `amfi_*` 接口，**没有 publish 这个
+IOService**，于是 loader abort，随后内核 panic（panic 文本没进日志环，只有 restart type 4）。
+
+下一步：在核心里 publish 一个 `AppleMobileFileIntegrity` IOService +
+`AppleMobileFileIntegrityUserClient`，按 loader 用到的 selector 返回成功
+（先反汇编 `/usr/libexec/launchd_cache_loader` 确认 selector 与参数）。
+
+### 现在的迭代方式（不用每次重建 16 GiB 镜像）
+
+- 内核改动 → 推 `xnu` 补丁 → `xnu.yml`（macOS runner，约 40 min）→ 下 artifact；
+- 用户态文件（keybag、以后的 containers/配置等）→ `tools/mkfwpack.py` 打 2 MiB 固件包 →
+  `pinfile create 2` + `rawwrite` → `mkadt_pandora.py --fw-extents` → `tools/mk_boot_local.sh`；
+- 一次 boot 测试：`tools/boot_test.sh`（建镜像 → `fastboot boot` → 拉日志）。
+
 
