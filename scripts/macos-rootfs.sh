@@ -64,13 +64,20 @@ caches=$(sudo find "$mnt/os" "$mnt/sys" -name 'dyld_shared_cache*' 2>/dev/null |
 printf '%s
 ' "$caches" | sed -n '1,10p'
 
-cache=$(sudo find "$mnt/dst" -name 'dyld_shared_cache_arm64e' -print -quit 2>/dev/null || true)
-if [ -n "$cache" ]; then
+# The iPhone X userland is plain arm64 (A11 has no arm64e): the cache is
+# dyld_shared_cache_arm64 plus split subcaches (.01 … .NN). dyld opens the main
+# file by name and then its siblings, so link the whole set.
+cache_dir=$(sudo find "$mnt/dst/private/preboot/Cryptexes" -name 'dyld_shared_cache_arm64' -print -quit 2>/dev/null || true)
+cache_dir=${cache_dir%/*}
+if [ -n "$cache_dir" ] && [ -d "$cache_dir" ]; then
 	sudo mkdir -p "$mnt/dst/System/Library/Caches/com.apple.dyld"
-	sudo ln -f "$cache" "$mnt/dst/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e" || true
-	echo "dyld cache hard link: $cache -> /System/Library/Caches/com.apple.dyld/"
+	for f in "$cache_dir"/dyld_shared_cache_arm64*; do
+		sudo ln -f "$f" "$mnt/dst/System/Library/Caches/com.apple.dyld/$(basename "$f")" 2>/dev/null || 			sudo cp -a "$f" "$mnt/dst/System/Library/Caches/com.apple.dyld/"
+	done
+	echo "dyld cache linked from $cache_dir:"
+	ls -l "$mnt/dst/System/Library/Caches/com.apple.dyld" | sed -n '1,12p'
 else
-	echo "WARNING: no dyld_shared_cache_arm64e in the image" >&2
+	echo "WARNING: no dyld_shared_cache_arm64 under private/preboot/Cryptexes" >&2
 fi
 
 # iOS 16 mounts the SystemOS cryptex at /System/Cryptexes/OS; here it lives
