@@ -1,0 +1,149 @@
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -12,6 +12,7 @@
+ iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
++iokit/Kernel/arm/SweetAMFI.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+diff --git a/iokit/Kernel/arm/SweetAMFI.cpp b/iokit/Kernel/arm/SweetAMFI.cpp
+new file mode 100644
+index 0000000..0000000
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAMFI.cpp
+@@ -0,0 +1,132 @@
++/*
++ * SweetAMFI: the IOKit face of AMFI for SWEET.
++ *
++ * launchd_cache_loader, launchd's "install the trust cache" boot task, looks
++ * the AMFI service up by class name and asks it about a cdhash:
++ *
++ *   IOServiceGetMatchingService(kIOMasterPortDefault,
++ *       IOServiceMatching("AppleMobileFileIntegrity"))
++ *   IOServiceOpen(service, mach_task_self(), 0, &conn)
++ *   IOConnectCallMethod(conn, 6, cdhash-input, …)   // success = trusted
++ *
++ * SWEET has no AppleMobileFileIntegrity kext: bsd/kern/sweet_amfi.c provides
++ * the kernel-side amfi_* entry points but publishes no service, so the loader
++ * aborted with "Unable to find AMFI" and the kernel panicked right after
++ * (restart type 4).
++ *
++ * Matching is by C++ class name: IOService::matchPropertyTable() metaCasts the
++ * service to the class named by the "IOProviderClass" value that
++ * IOServiceMatching() puts in the dictionary, so the class below has to be
++ * called exactly AppleMobileFileIntegrity.  The user client is looked up the
++ * same way, through the IOUserClientClass property (as SweetKeyStore does for
++ * AppleKeyStore).
++ *
++ * There is no Image4 and no trust cache on SWEET; sweet_amfi.c marks every
++ * binary on the root filesystem as a platform binary instead, so answering
++ * "trusted" is consistent with what the kernel already does.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <sys/errno.h>
++
++/* The only selector launchd_cache_loader uses: "is this cdhash trusted?". */
++#define SWEET_AMFI_QUERY_CDHASH   6
++
++class AppleMobileFileIntegrity : public IOService {
++	OSDeclareDefaultStructors(AppleMobileFileIntegrity);
++
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrity, IOService);
++
++bool
++AppleMobileFileIntegrity::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "AppleMobileFileIntegrityUserClient");
++	registerService();
++	IOLog("SWEET AMFI: AppleMobileFileIntegrity registered\n");
++	return true;
++}
++
++class AppleMobileFileIntegrityUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(AppleMobileFileIntegrityUserClient);
++
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target,
++	    void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(AppleMobileFileIntegrityUserClient, IOUserClient);
++
++IOReturn
++AppleMobileFileIntegrityUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++AppleMobileFileIntegrityUserClient::externalMethod(uint32_t selector,
++    IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++    OSObject *target, void *reference)
++{
++	(void)dispatch;
++	(void)target;
++	(void)reference;
++
++	switch (selector) {
++	case SWEET_AMFI_QUERY_CDHASH:
++		(void)args;
++		return kIOReturnSuccess;
++	default:
++		IOLog("SWEET AMFI: sel %u unsupported\n", selector);
++		return kIOReturnUnsupported;
++	}
++}
++
++/* Called from bsd/dev/pandora_preboot.c once the kernel is up: publishes the
++ * service launchd_cache_loader matches on.  Safe to call more than once. */
++extern "C" int
++sweet_amfi_publish(void)
++{
++	static AppleMobileFileIntegrity *service;
++	IOService *root;
++
++	if (service != NULL) {
++		return 0;
++	}
++	root = IOService::getServiceRoot();
++	if (root == NULL) {
++		return ENODEV;
++	}
++	service = OSTypeAlloc(AppleMobileFileIntegrity);
++	if (service == NULL) {
++		return ENOMEM;
++	}
++	if (!service->init() || !service->attach(root)) {
++		service->release();
++		service = NULL;
++		return ENODEV;
++	}
++	if (!service->start(root)) {
++		service->detach(root);
++		service->release();
++		service = NULL;
++		return ENODEV;
++	}
++	return 0;
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */

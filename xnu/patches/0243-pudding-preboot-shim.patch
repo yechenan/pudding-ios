@@ -1,8 +1,7 @@
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 091e113..2d6a61e 100755
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -125,6 +125,7 @@ bsd/dev/pandora_gpu.c			standard
+@@ -125,6 +125,7 @@
  bsd/dev/pandora_cpu.c			standard
  bsd/dev/pandora_autoswipe.c		standard
  bsd/dev/pandora_dpu.c			standard
@@ -10,12 +9,91 @@ index 091e113..2d6a61e 100755
  bsd/dev/adreno/ArmSmmu4K.c		standard
  bsd/dev/adreno/ArmSmmu4KContext.c		standard
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
+diff --git a/bsd/vfs/vfs_conf.c b/bsd/vfs/vfs_conf.c
+--- a/bsd/vfs/vfs_conf.c
++++ b/bsd/vfs/vfs_conf.c
+@@ -97,6 +97,9 @@
+ extern  const struct vfsops routefs_vfsops;
+ extern  struct vfsops nullfs_vfsops;
+ extern struct vfsops bindfs_vfsops;
++#if defined(PANDORA)
++extern struct vfsops pandora_apfs_vfsops;
++#endif
+ 
+ #if MOCKFS
+ extern  struct vfsops mockfs_vfsops;
+@@ -110,6 +113,7 @@
+ 	FT_ROUTEFS = 21,
+ 	FT_NULLFS = 22,
+ 	FT_BINDFS = 23,
++	FT_APFS = 24,
+ 	FT_MOCKFS  = 0x6D6F636B
+ };
+ 
+@@ -193,6 +197,28 @@
+ 		.vfc_sysctl = NULL
+ 	},
+ #endif /* BINDFS */
++
++#if defined(PANDORA)
++	/* libignition (in dyld) looks the preboot volume up by role and then
++	 * mounts "apfs" on it.  This entry makes the name resolve so its mount
++	 * op can answer EBUSY -- "preboot already mounted" -- with an HFS+ root;
++	 * bsd/dev/pandora_preboot.c has the details. */
++	{
++		.vfc_vfsops = &pandora_apfs_vfsops,
++		.vfc_name = "apfs",
++		.vfc_typenum = FT_APFS,
++		.vfc_refcount = 0,
++		.vfc_flags = MNT_DONTBROWSE | MNT_RDONLY,
++		.vfc_mountroot = NULL,
++		.vfc_next = NULL,
++		.vfc_reserved1 = 0,
++		.vfc_reserved2 = 0,
++		.vfc_vfsflags = VFC_VFS64BITREADY,
++		.vfc_descptr = NULL,
++		.vfc_descsize = 0,
++		.vfc_sysctl = NULL
++	},
++#endif /* PANDORA */
+ 
+ #if MOCKFS
+ 	/* If we are configured for it, mockfs should always be the last standard entry (and thus the last FS we attempt mountroot with) */
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -12529,6 +12529,10 @@
+  * Make a filesystem-specific control call:
+  */
+ /* ARGSUSED */
++#if defined(PANDORA)
++extern int pandora_preboot_fsctl(u_long cmd, caddr_t data, int size);
++#endif
++
+ static int
+ fsctl_internal(proc_t p, vnode_t *arg_vp, u_long cmd, user_addr_t udata, u_long options, vfs_context_t ctx)
+ {
+@@ -12596,6 +12600,14 @@
+ 
+ 	/* Check to see if it's a generic command */
+ 	switch (cmd) {
++#if defined(PANDORA)
++	case 0xc1044a50ul:
++		/* _IOWR('J', 80, 260): libignition asks which device node backs a
++		 * volume role (op 2, role 16 = VFS_PREBOOT_ROLE).  APFS answers it;
++		 * see bsd/dev/pandora_preboot.c. */
++		error = pandora_preboot_fsctl(cmd, data, (int)size);
++		break;
++#endif
+ 	case FSIOC_SYNC_VOLUME:
+ 		error = handle_sync_volume(vp, arg_vp, data, ctx);
+ 		break;
 diff --git a/bsd/dev/pandora_preboot.c b/bsd/dev/pandora_preboot.c
-new file mode 100755
-index 0000000..e8d8aaf
+new file mode 100644
+index 0000000..0000000
 --- /dev/null
 +++ b/bsd/dev/pandora_preboot.c
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,232 @@
 +/*
 + * PANDORA preboot shim (patch 0243): make iOS 16 libignition's "preboot"
 + * stage succeed on an HFS+ root.
@@ -67,6 +145,7 @@ index 0000000..e8d8aaf
 +#include <string.h>
 +
 +extern int pandora_mkdir(const char *path, int mode);          /* bsd/vfs/vfs_syscalls.c */
++extern int sweet_amfi_publish(void);                           /* iokit/Kernel/arm/SweetAMFI.cpp */
 +extern bool IOGetBootManifestHash(char *hash, size_t *size);   /* iokit/bsddev/IOKitBSDInit.cpp */
 +
 +/* fsctl("/", _IOWR('J', 80, 260)): 260 = 2 + 2 + 256 */
@@ -175,6 +254,13 @@ index 0000000..e8d8aaf
 +	}
 +	pandora_preboot_ready = TRUE;
 +
++	/* Publish AppleMobileFileIntegrity early: launchd_cache_loader matches it
++	 * by class name at ~12 s and aborted (then the kernel panicked) without it. */
++	if (sweet_amfi_publish() != 0) {
++		printf("PANDORA PREBOOT: no AMFI service
++");
++	}
++
 +	/* keybagd (MKB) opens the system keybag on the data volume and reboots
 +	 * when the open fails ("Could not open /private/var/keybags/systembag.kb
 +	 * ... FATAL KEYBAG ERROR").  This machine has no data volume, so give it
@@ -240,84 +326,3 @@ index 0000000..e8d8aaf
 +    pandora_apfs_edt_fstab, "-", "volume role to mount point table");
 +
 +#endif /* PANDORA */
-diff --git a/bsd/vfs/vfs_conf.c b/bsd/vfs/vfs_conf.c
-index bae70cd..2d7616f 100755
---- a/bsd/vfs/vfs_conf.c
-+++ b/bsd/vfs/vfs_conf.c
-@@ -97,6 +97,9 @@ extern  struct vfsops devfs_vfsops;
- extern  const struct vfsops routefs_vfsops;
- extern  struct vfsops nullfs_vfsops;
- extern struct vfsops bindfs_vfsops;
-+#if defined(PANDORA)
-+extern struct vfsops pandora_apfs_vfsops;
-+#endif
- 
- #if MOCKFS
- extern  struct vfsops mockfs_vfsops;
-@@ -110,6 +113,7 @@ enum fs_type_num {
- 	FT_ROUTEFS = 21,
- 	FT_NULLFS = 22,
- 	FT_BINDFS = 23,
-+	FT_APFS = 24,
- 	FT_MOCKFS  = 0x6D6F636B
- };
- 
-@@ -194,6 +198,28 @@ static struct vfstable vfstbllist[] = {
- 	},
- #endif /* BINDFS */
- 
-+#if defined(PANDORA)
-+	/* libignition (in dyld) looks the preboot volume up by role and then
-+	 * mounts "apfs" on it.  This entry makes the name resolve so its mount
-+	 * op can answer EBUSY -- "preboot already mounted" -- with an HFS+ root;
-+	 * bsd/dev/pandora_preboot.c has the details. */
-+	{
-+		.vfc_vfsops = &pandora_apfs_vfsops,
-+		.vfc_name = "apfs",
-+		.vfc_typenum = FT_APFS,
-+		.vfc_refcount = 0,
-+		.vfc_flags = MNT_DONTBROWSE | MNT_RDONLY,
-+		.vfc_mountroot = NULL,
-+		.vfc_next = NULL,
-+		.vfc_reserved1 = 0,
-+		.vfc_reserved2 = 0,
-+		.vfc_vfsflags = VFC_VFS64BITREADY,
-+		.vfc_descptr = NULL,
-+		.vfc_descsize = 0,
-+		.vfc_sysctl = NULL
-+	},
-+#endif /* PANDORA */
-+
- #if MOCKFS
- 	/* If we are configured for it, mockfs should always be the last standard entry (and thus the last FS we attempt mountroot with) */
- 	{
-diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
-index b9870bd..8ee757f 100755
---- a/bsd/vfs/vfs_syscalls.c
-+++ b/bsd/vfs/vfs_syscalls.c
-@@ -12529,6 +12529,10 @@ handle_auth(vnode_t vp, u_long cmd, caddr_t data, u_long options, vfs_context_t
-  * Make a filesystem-specific control call:
-  */
- /* ARGSUSED */
-+#if defined(PANDORA)
-+extern int pandora_preboot_fsctl(u_long cmd, caddr_t data, int size);
-+#endif
-+
- static int
- fsctl_internal(proc_t p, vnode_t *arg_vp, u_long cmd, user_addr_t udata, u_long options, vfs_context_t ctx)
- {
-@@ -12596,6 +12600,14 @@ fsctl_internal(proc_t p, vnode_t *arg_vp, u_long cmd, user_addr_t udata, u_long
- 
- 	/* Check to see if it's a generic command */
- 	switch (cmd) {
-+#if defined(PANDORA)
-+	case 0xc1044a50ul:
-+		/* _IOWR('J', 80, 260): libignition asks which device node backs a
-+		 * volume role (op 2, role 16 = VFS_PREBOOT_ROLE).  APFS answers it;
-+		 * see bsd/dev/pandora_preboot.c. */
-+		error = pandora_preboot_fsctl(cmd, data, (int)size);
-+		break;
-+#endif
- 	case FSIOC_SYNC_VOLUME:
- 		error = handle_sync_volume(vp, arg_vp, data, ctx);
- 		break;
