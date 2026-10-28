@@ -25,6 +25,18 @@ repo=${REPO:-yechenan/pudding-ios}
 
 mkdir -p "$out"
 
+# The ADT with the firmware-pack extents is easy to lose (it is rebuildable from
+# the pinned files' extent JSONs), so regenerate it when it is missing.
+if [ ! -f "$adt" ]; then
+	echo "== regenerating $adt"
+	mkdir -p "$(dirname "$adt")"
+	wsl -e bash -lc "cd /mnt/c/$(printf '%s' "$root" | sed 's|^/c/||') && D22AP_ADT=pudding-hw/d22ap.adt \
+		python3 data-a-live/tools/mkadt_pandora.py '$(printf '%s' "$adt" | sed 's|^/c/|/mnt/c/|')' \
+		--root-extents pudding-hw/iosroot-extents.json \
+		--log-extents pudding-hw/ioslog-extents.json \
+		--fw-extents pack/fw-extents.json" | tail -1
+fi
+
 echo "== artifact of run $run"
 art=$(curl -s -H "Authorization: Bearer $token" \
 	"https://api.github.com/repos/$repo/actions/runs/$run/artifacts" |
