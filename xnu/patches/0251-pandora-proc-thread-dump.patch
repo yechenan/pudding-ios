@@ -1,0 +1,152 @@
+--- a/bsd/dev/pandora_selftest.c
++++ b/bsd/dev/pandora_selftest.c
+@@ -17,6 +17,9 @@
+ #if defined(PANDORA)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <sys/user.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/task.h>
+@@ -104,11 +107,139 @@
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * 0250: screen timeline for unattended runs. Every pandora_thumbs_every seconds starting at
++ * pandora_thumbs_start, until pandora_thumbs_until (0 = until the reset), print the screen as
++ * the 60x130 ASCII thumbnail sweet_fb_thumb makes, tagged with the uptime in seconds. A log
++ * pulled after the session then shows what the screen did at every step, instead of the one
++ * frame that happened to be dumped by pandora_fbdump.
++ */
++void pandora_thumbs_init(void);
++
++static void
++th_thread(void *arg, wait_result_t result)
++{
++	unsigned start = 0, every = 60, until = 0;
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("pandora_thumbs_start", &start, sizeof(start));
++	(void)PE_parse_boot_argn("pandora_thumbs_every", &every, sizeof(every));
++	(void)PE_parse_boot_argn("pandora_thumbs_until", &until, sizeof(until));
++	if (every == 0) {
++		every = 60;
++	}
++	printf("PANDORA THUMBS: every %u s from %u s until %u\n", every, start, until);
++	if (start) {
++		st_sleep(start * 1000u);
++	}
++	for (;;) {
++		uint64_t ab = 0, ns = 0;
++		unsigned secs;
++		char tag[24];
++		clock_get_uptime(&ab);
++		absolutetime_to_nanoseconds(ab, &ns);
++		secs = (unsigned)(ns / 1000000000ull);
++		snprintf(tag, sizeof(tag), "%u", secs);
++		sweet_fb_thumb(tag);
++		if (until != 0 && secs >= until) {
++			break;
++		}
++		st_sleep(every * 1000u);
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++pandora_thumbs_init(void)
++{
++	thread_t thread;
++	unsigned start = 0;
++	if (!PE_parse_boot_argn("pandora_thumbs_start", &start, sizeof(start)) || start == 0) {
++		return;
++	}
++	if (kernel_thread_start(th_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++/*
++ * 0251: process/thread snapshot. pandora_ps=SECONDS (first dump), pandora_ps_every=SECONDS
++ * (repeat, up to 8 dumps). One line per process and one per thread, so a run without a
++ * working screen still says whether SpringBoard is blocked (TH_WAIT plus a wait event) or
++ * spinning, and which processes exist at that moment.
++ */
++void pandora_ps_init(void);
++
++static int
++ps_one(proc_t p, void *arg)
++{
++	char name[64];
++	uthread_t ut;
++	int n = 0;
++
++	(void)arg;
++	proc_name(p->p_pid, name, sizeof(name));
++	TAILQ_FOREACH(ut, &p->p_uthlist, uu_list) {
++		n++;
++	}
++	printf("PS p %d %d %d %s thr %d\n", p->p_pid, p->p_ppid, p->p_stat, name, n);
++	TAILQ_FOREACH(ut, &p->p_uthlist, uu_list) {
++		printf("PS t %d st %d a0 %llx a1 %llx sys %d wm %llx wc %llx\n", p->p_pid,
++		    (int)ut->uu_flag,
++		    (unsigned long long)ut->uu_arg[0], (unsigned long long)ut->uu_arg[1],
++		    (int)ut->syscall_code,
++		    (unsigned long long)(uintptr_t)ut->uu_wmesg,
++		    (unsigned long long)(uintptr_t)ut->uu_wchan);
++	}
++	return PROC_RETURNED;
++}
++
++static void
++ps_thread(void *arg, wait_result_t result)
++{
++	unsigned start = 0, every = 0;
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("pandora_ps", &start, sizeof(start));
++	(void)PE_parse_boot_argn("pandora_ps_every", &every, sizeof(every));
++	if (start) {
++		st_sleep(start * 1000u);
++	}
++	for (int i = 0; i < 8; i++) {
++		printf("PANDORA PS: begin\n");
++		proc_iterate(PROC_ALLPROCLIST, ps_one, NULL, NULL, NULL);
++		printf("PANDORA PS: end\n");
++		if (every == 0) {
++			break;
++		}
++		st_sleep(every * 1000u);
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++pandora_ps_init(void)
++{
++	thread_t thread;
++	unsigned start = 0;
++	if (!PE_parse_boot_argn("pandora_ps", &start, sizeof(start)) || start == 0) {
++		return;
++	}
++	if (kernel_thread_start(ps_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ void
+ pandora_selftest_init(void)
+ {
+ 	thread_t thread;
+ 	unsigned secs = 0;
++
++	pandora_thumbs_init();
++	pandora_ps_init();
+ 	if (!PE_parse_boot_argn("pandora_selftest", &secs, sizeof(secs)) || secs == 0) {
+ 		return;
+ 	}
