@@ -263,3 +263,16 @@ IOService**，于是 loader abort，随后内核 panic（panic 文本没进日�
   **0 error**；三个补丁 `git apply --check` 通过。
 - 当晚 17:40–18:00 期间 **所有 macOS 池（13/14/15）都排不上机器**，连几十秒的
   `ping` 也被排到 15 分钟上限后取消，只能高频重派抢票。
+
+- 18:10 追加：AMFI 服务的两次发布机会 —— 除了 preboot shim（~0.2 s），
+  `pandora_files` 的内核线程在根卷挂载后 2 s 再试一次，
+  避免 0.2 s 时 IOKit service root 还没建好导致服务永远不存在。
+  另核对 `IOService::newUserClient` 的默认实现确实按
+  `IOUserClientClass` 属性用 `OSMetaClass::allocClassWithName` 实例化
+  user client（与 AppleKeyStore 同一机制），所以 `0244` 的写法成立。
+- launchd 的 boot task 名字（从 `/sbin/launchd` 里取出，按上次日志的顺序）：
+  `mount-phase-1 → data-protection → finish-obliteration →
+  detect-installed-roots → commit-boot-mode → restore-datapartition →
+  mount-phase-2 → init-with-data-volume → MSUEarlyBootTask → fips → keybag →
+  usermanagerd → launchd_cache_loader`；之后才是 532 个 LaunchDaemons 的
+  daemon 阶段。
