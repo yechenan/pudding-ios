@@ -1,0 +1,72 @@
+--- a/bsd/dev/pandora_selftest.c
++++ b/bsd/dev/pandora_selftest.c
+@@ -103,11 +103,69 @@
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * 0250: screen timeline for unattended runs. Every pandora_thumbs_every seconds starting at
++ * pandora_thumbs_start, until pandora_thumbs_until (0 = until the reset), print the screen as
++ * the 60x130 ASCII thumbnail sweet_fb_thumb makes, tagged with the uptime in seconds. A log
++ * pulled after the session then shows what the screen did at every step, instead of the one
++ * frame that happened to be dumped by pandora_fbdump.
++ */
++void pandora_thumbs_init(void);
++
++static void
++th_thread(void *arg, wait_result_t result)
++{
++	unsigned start = 0, every = 60, until = 0;
++	(void)arg;
++	(void)result;
++	(void)PE_parse_boot_argn("pandora_thumbs_start", &start, sizeof(start));
++	(void)PE_parse_boot_argn("pandora_thumbs_every", &every, sizeof(every));
++	(void)PE_parse_boot_argn("pandora_thumbs_until", &until, sizeof(until));
++	if (every == 0) {
++		every = 60;
++	}
++	printf("PANDORA THUMBS: every %u s from %u s until %u\n", every, start, until);
++	if (start) {
++		st_sleep(start * 1000u);
++	}
++	for (;;) {
++		uint64_t ab = 0, ns = 0;
++		unsigned secs;
++		char tag[24];
++		clock_get_uptime(&ab);
++		absolutetime_to_nanoseconds(ab, &ns);
++		secs = (unsigned)(ns / 1000000000ull);
++		snprintf(tag, sizeof(tag), "%u", secs);
++		sweet_fb_thumb(tag);
++		if (until != 0 && secs >= until) {
++			break;
++		}
++		st_sleep(every * 1000u);
++	}
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++pandora_thumbs_init(void)
++{
++	thread_t thread;
++	unsigned start = 0;
++	if (!PE_parse_boot_argn("pandora_thumbs_start", &start, sizeof(start)) || start == 0) {
++		return;
++	}
++	if (kernel_thread_start(th_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ void
+ pandora_selftest_init(void)
+ {
+ 	thread_t thread;
+ 	unsigned secs = 0;
++
++	pandora_thumbs_init();
+ 	if (!PE_parse_boot_argn("pandora_selftest", &secs, sizeof(secs)) || secs == 0) {
+ 		return;
+ 	}

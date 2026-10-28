@@ -561,3 +561,30 @@ mount`，按启动次序统计：
 2. 若到锁屏：用 `pandora_selftest` 注入上滑手势解锁（`st_swipe` 起点 562,2425 → 562,1100），
    再往桌面推；
 3. 若不到：按缩略图时间线定位卡在哪个阶段，再决定改内核还是改镜像。
+
+### 2026-10-29 01:20 恢复镜像时踩到的坑：`/data/local/tmp` 是 FBE 加密的
+
+把 16 GiB 镜像 `adb push` 回 `/data/local/tmp/iosroot.img` 之后，用 `pinfile extents` 拿到
+的新 extents 去读裸设备，第一个块的 1024 偏移处是**乱码**而不是 `HX`（HFSX 卷头），
+但用 `dd if=/data/local/tmp/iosroot.img` 走 VFS 读同一个文件却是正常的 `HX`。
+
+原因：`/data/local/tmp` 在文件级加密（FBE）的分区上。**通过 VFS 写进去的文件，裸块上是
+密文**；而内核的 extent root 是直接从裸块读的。所以：
+
+- `pinfile create` + 内核写日志的那条路（`rawwrite`）是对的 —— 裸块上是明文；
+- 用 `adb push` / `dd` / `cp` 直接写 pinned 文件是**错的** —— 裸块上全是密文，内核挂载会失败。
+
+正确的恢复流程（`tools/restore_root.sh` 已按这个改）：
+
+1. `adb push 镜像 /data/local/tmp/iosroot-src.img`（VFS，密文没关系，只是运输）；
+2. 若 pinned 文件丢了 pin（`adb push` 会换 inode，pin 会丢）：`pinfile create <目标> 16384`；
+3. `pinfile rawwrite <目标> <userdata 设备> all --yes < /data/local/tmp/iosroot-src.img`
+   —— 它把源文件**通过 VFS 解密读出**，再写到目标的裸块上（明文）；
+4. 校验：新 extents 的第一个块 1024 处必须是 `HX`。
+
+实测：16 GiB 的 `rawwrite` **1 分 50 秒**（写出 sha256 可回读校验），比原来"push 6 分钟
++ 回写"快得多。
+
+另外 `tools/prepare_run.sh KERNEL OUTDIR WINDOW "额外启动参数"` 把
+"读当前 extents → 生成 ADT（带 D22AP 的 /product）→ 建 boot 镜像 → 校验 cmdline"
+合成一条命令；f2fs 会在文件被重写后换位置，所以每次跑之前都重建 ADT，不再复用旧镜像。
