@@ -341,3 +341,23 @@ sig 5 code 0x600000001 ... reason ns 2 code 0x5`），12 次后 launchd 报
   （`600 frames / 5000 ms ≈ 120 fps`、`14000 swaps`）；没有 `Setup`/`Buddy`。
 - 结论：内核侧的启动链已经能一路走到用户态图形栈，剩下的问题是
   **激活状态/激活服务这层用户态逻辑**（以及后续的 setup 流程）。
+
+### 20:30 对整机状态的判读
+
+- `CRASH` 统计：整场只有 **mobileactivation 一个**（68 次），**SpringBoard 没崩**；
+  SpringBoard 在 58.7 s 还在正常调用 `AppleKeyStore`（sel 0/35/7 都成功）。
+- 也就是说：系统已经跑在一个"只有激活服务挂掉"的状态里，图形栈、KeyStore、
+  sandbox、AMFI 都是通的。
+- `mobileactivationd` 的断言点在 ObjC KVC 路径上（crash 前是一串
+  `objc_msgSend`/`setValue:forKey:` 的调用），说明是它自己期望的某个
+  "激活相关对象/状态"不存在，而不是内核少给了什么调用。
+
+**下一步（按代价排序）**：
+
+1. 让 `mobileactivationd` 不再致命：在 rootfs 里替换它的 launchd plist
+   （`RunAtLoad=false`/改 KeepAlive），或直接替换/打补丁该二进制；
+   这两件事都要**写根卷**，可以走已有的 fw-pack 安装路径（`pandora_files`），
+   需要新内核。
+2. 或者预置一个"已激活"状态（activation record / mad 目录），再看 SpringBoard
+   是否直接进桌面。
+3. 无论哪条，内核侧不再需要改动 —— 启动链已经打通。
