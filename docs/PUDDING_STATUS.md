@@ -773,3 +773,28 @@ run6 就用这个镜像跑，看 SpringBoard 的锁屏会不会真的出现。
    的断言，锁屏/桌面可能一起解决。
 4. **激活**：mad 的断言在 `copyReverseProxyDictionary`（网络代理字典），可以试
    给镜像补一份 `SystemConfiguration/preferences.plist`（ios-sweet v15 的做法）。
+
+### 05:25 run7（40 分钟窗口）：不是慢，是真停住了
+
+`pandora_reboot_after=2400`、缩略图每 120 s、线程表在 1000/1900 s。结果：
+
+```
+presents: 16 次，最后一次在 836.7 s          ← 40 分钟里再没有第 17 帧
+screen timeline: 132s .. 2400s 全部 same hash（bright=71）
+SpringBoard: 1000 s 13 个线程，1900 s 12 个（少了一个，说明还有活着的线程退出了）
+|SpringBoard| 日志：836 s 之后 0 行
+```
+
+836.2–836.7 s 之间是 **一串 10 帧的动画**（启动画面淡出），之后 backboardd 再没有提交过任何帧。
+所以不是"还没画完"，而是 **SpringBoard 在把第一帧交给合成器之前就停住了**；backboardd 那边
+没有新内容可合成，屏幕就一直停在淡出后的那一帧（logo）。
+
+### 下一步最值得做的instrumentation：`pandora_cat`
+
+现在的盲点是"SpringBoard 到底卡在哪个调用"。iOS 自己其实会记录：run7 里 1100 s 起了
+`spindump`（系统级 stack sampler），如果它把报告写进了 `/private/var/db/spindump/` 或
+`/var/log/`，我们只要能在**运行中**把文件读出来，就能拿到 SpringBoard 的用户态调用栈。
+
+内核有完整的 VFS，加一个 boot-arg 的"定时把某个文件的内容打进内核日志"（`pandora_cat=路径:秒数`）
+是很小的改动，却能让以后所有"进程不动了"的问题都有栈可看。这比继续猜 10-bit surface /
+海报 / 激活都更值。
