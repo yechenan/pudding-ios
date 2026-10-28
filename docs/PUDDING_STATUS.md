@@ -228,4 +228,21 @@ IOService**，于是 loader abort，随后内核 panic（panic 文本没进日�
   `pinfile create 2` + `rawwrite` → `mkadt_pandora.py --fw-extents` → `tools/mk_boot_local.sh`；
 - 一次 boot 测试：`tools/boot_test.sh`（建镜像 → `fastboot boot` → 拉日志）。
 
+### 2026-10-28 傍晚：AMFI 补丁卡在 CI 排队，不是代码
 
+- `launchd_cache_loader` 要的东西已经完整反汇编出来：
+  `IOServiceMatching("AppleMobileFileIntegrity")` → `IOServiceOpen(type 0)` →
+  `IOConnectCallMethod(sel 6, cdhash)`，返回成功即"trusted"。补丁 0244 按
+  `SweetKeyStore`（AppleKeyStore）的同一套写法 publish 服务和 user client。
+- 顺带加了 `/private/preboot/cryptex1`（`cryptex1 sniff` 的 `fstatat` 失败会返回 8，
+  上一轮 ignition 就停在那里）。
+- **macOS runner 的坑**：
+  - `macos-14` / `macos-13`（带 Xcode 15）今天傍晚整池不调度，连 `ping` 都排着；
+  - `macos-15` 能给机器，但镜像只有 Xcode 16/26，`iig` 生成的代码用
+    `IORPC.kernelContent`，xnu-8796 的 `IORPC` 没有这个成员 → 成片
+    `OSObject.iig.cpp: no member named 'kernelContent'`；
+  - 结论：内核必须跑在 Xcode 15 的池子上，只能等；`xnu.yml` 的 `runner` 输入默认
+    已改成 `macos-15` 是错的，应改回 `macos-14`，`macos-15` 只用于非内核任务。
+- 本地能做的验证都做了：`pandora_preboot.c`（CI 编译命令，0 error）、
+  `SweetAMFI.cpp`（同一套 include/flags，0 error）、两个补丁 `git apply --check` 通过。
+  上一轮的失败里有一个是真正的代码 bug（`printf` 字符串被写成跨行），已修。
