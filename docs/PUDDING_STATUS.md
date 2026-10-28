@@ -441,3 +441,22 @@ flush 文件与 HFS 日志。两者都是内核侧改动，属于下一轮的工
   497 次 exec、120 fps 帧缓冲、无 panic；
 - 唯一用户态卡点：`mobileactivationd` 的 ObjC 断言（激活服务）；
 - 所有改动已推送（最新 `ecb1ff11` 含 0247），文档即本文件。
+
+### 21:15 判定实验结果：写入**没有落盘**
+
+同一份包、同一内核连续启动两次，安装行都是 `1 written`（第二次没有变成
+`... already the same`）→ `pf_write` 的写入没有持久化；`mobileactivationd` 两次都是
+17 次 exec / 68 次崩溃，plist 覆盖完全无效。
+
+已有的相关实现都在：`hfs_vfsops` 有 `.vfs_sync = hfs_sync`，`hfs_vnops` 有
+`hfs_vnop_fsync`（vnode 表里也挂了），挂载时 `jnl: replay_journal` 正常。所以问题
+不在"没实现"，更可能是：
+
+1. `/System` 在这个镜像里不是普通目录（iOS 16 的 firmlink/卷布局），
+   `vnode_open("/System/...")` 解析到的挂载点与 launchd 读的不是同一个；
+2. 或者 SWEET HFS 的写入是"内存覆盖"语义，`vfs_sync`/`fsync` 没有把它推进 journal。
+
+**下一步诊断（便宜且直接）**：在 `pandora_files` 里打印目标路径所在挂载点
+（`vnode_mount(vp)` 的 `mnt_stat.f_mntonname` + `f_fstypename`），并在安装后立刻
+从内核读回该文件前 16 字节；如果读回是新的、重启又变旧，就是持久化问题；
+如果读回就是旧的，就是路径/挂载点问题。
