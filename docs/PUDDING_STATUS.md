@@ -382,3 +382,19 @@ sig 5 code 0x600000001 ... reason ns 2 code 0x5`），12 次后 launchd 报
 限制：pinned 文件是 2 MiB（`PF_MAX_FILE` 也限制单文件大小），换 2.4 MB 的
 `mobileactivationd` 二进制放不下 —— 要么换成小体积的 plist/记录，要么以后把
 pinned 文件扩大。
+
+### 20:55 mobileactivationd 断言点的一个线索
+
+崩溃返回地址落在 `copyReverseProxyDictionary` 这个函数里（旁边还有
+`copyReverseProxyDictionary` 的字符串字面量），这一段全是 `objc_msgSend` +
+`setValue:forKey:` 的 KVC/字典拷贝，最后共享的 trait 是 `__text` 末尾的
+`brk #0x1`。结合上下文（activation 服务要做网络请求、要读代理配置），
+最可能是**它自己抛出的 ObjC 异常**（未识别 selector / KVC 键不存在），
+而不是内核接口缺失。
+
+下一步验证顺序（都不需要改内核）：
+1. 用 fw-pack 换掉 `com.apple.mobileactivationd.plist`，让这个服务以
+   `/usr/bin/true` 形式"启动即退出"，看 SpringBoard 是否继续往桌面走；
+2. 给模拟的网络（`SWEET NET`）补一个可用的接口/DHCP，排除"没有网络导致
+   activation 断言"；
+3. 最后才是预置激活记录。
