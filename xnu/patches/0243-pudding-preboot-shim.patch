@@ -12,10 +12,10 @@ index 091e113..2d6a61e 100755
  bsd/dev/adreno/ArmSmmu4KProgram.c		standard
 diff --git a/bsd/dev/pandora_preboot.c b/bsd/dev/pandora_preboot.c
 new file mode 100755
-index 0000000..d810b09
+index 0000000..e8d8aaf
 --- /dev/null
 +++ b/bsd/dev/pandora_preboot.c
-@@ -0,0 +1,207 @@
+@@ -0,0 +1,224 @@
 +/*
 + * PANDORA preboot shim (patch 0243): make iOS 16 libignition's "preboot"
 + * stage succeed on an HFS+ root.
@@ -136,6 +136,21 @@ index 0000000..d810b09
 +	.vfs_init  = pandora_apfs_init,
 +};
 +
++/* Create an empty file (or leave an existing one alone). */
++static int
++pandora_touch(const char *path, int mode)
++{
++	vnode_t vp = NULLVP;
++	int error = vnode_open(path, O_CREAT | FWRITE, mode, 0, &vp, vfs_context_kernel());
++
++	if (error == 0) {
++		vnode_close(vp, FWRITE, vfs_context_kernel());
++	} else if (error == EEXIST) {
++		error = 0;
++	}
++	return error;
++}
++
 +/* Every path under /private/preboot the boot sequence looks for.  HFS+ takes
 + * one level at a time, and EEXIST is the normal case after the first boot. */
 +static const char * const pandora_preboot_dirs[] = {
@@ -160,6 +175,16 @@ index 0000000..d810b09
 +	}
 +	pandora_preboot_ready = TRUE;
 +
++	/* keybagd (MKB) opens the system keybag on the data volume and reboots
++	 * when the open fails ("Could not open /private/var/keybags/systembag.kb
++	 * ... FATAL KEYBAG ERROR").  This machine has no data volume, so give it
++	 * an empty file there: MKB then reports an empty keybag instead of dying
++	 * at the open. */
++	(void)pandora_mkdir("/private/var", 0755);
++	(void)pandora_mkdir("/private/var/keybags", 0700);
++	error = pandora_touch("/private/var/keybags/systembag.kb", 0600);
++	printf("PANDORA PREBOOT: /private/var/keybags/systembag.kb: %d\n", error);
++
 +	(void)pandora_mkdir("/private/preboot", 0755);
 +
 +	if (!IOGetBootManifestHash((char *)hash, &hlen) || hlen == 0 || hlen > sizeof(hash)) {
@@ -174,29 +199,21 @@ index 0000000..d810b09
 +
 +	snprintf(path, sizeof(path), "/private/preboot/%s", hex);
 +	error = pandora_mkdir(path, 0755);
-+	if (error != 0) {
++	if (error != 0 && error != EEXIST) {
 +		printf("PANDORA PREBOOT: %s: error %d\n", path, error);
 +		return;
 +	}
 +	for (size_t i = 0; i < sizeof(pandora_preboot_dirs) / sizeof(pandora_preboot_dirs[0]); i++) {
 +		snprintf(path, sizeof(path), "/private/preboot/%s/%s", hex, pandora_preboot_dirs[i]);
 +		error = pandora_mkdir(path, 0755);
-+		if (error != 0) {
++		if (error != 0 && error != EEXIST) {
 +			printf("PANDORA PREBOOT: %s: error %d\n", path, error);
 +		}
 +	}
 +
 +	snprintf(path, sizeof(path), "/private/preboot/%s/.roots-installed", hex);
-+	vnode_t vp = NULLVP;
-+	error = vnode_open(path, O_CREAT | FWRITE, 0644, 0, &vp, vfs_context_kernel());
-+	if (error == 0) {
-+		vnode_close(vp, FWRITE, vfs_context_kernel());
-+	} else if (error != EEXIST) {
-+		printf("PANDORA PREBOOT: %s: error %d\n", path, error);
-+	} else {
-+		error = 0;
-+	}
-+	printf("PANDORA PREBOOT: %s/%s: %d\n", "/private/preboot", hex, error);
++	error = pandora_touch(path, 0644);
++	printf("PANDORA PREBOOT: /private/preboot/%s: %d\n", hex, error);
 +}
 +
 +static int
