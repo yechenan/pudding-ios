@@ -460,3 +460,32 @@ flush 文件与 HFS 日志。两者都是内核侧改动，属于下一轮的工
 （`vnode_mount(vp)` 的 `mnt_stat.f_mntonname` + `f_fstypename`），并在安装后立刻
 从内核读回该文件前 16 字节；如果读回是新的、重启又变旧，就是持久化问题；
 如果读回就是旧的，就是路径/挂载点问题。
+
+### 22:45 本地构建链跑通了（不再依赖 CI 排队）
+
+在 WSL 里照着 data-a-live 的做法把苹果链接器搬到 Linux：
+
+1. `cctools-port` 的 configure 要求 `libdispatch`；Ubuntu 没有这个包，于是用 clang
+   编译安装 `swift-corelibs-libdispatch`（`-DCMAKE_C_COMPILER=clang`，gcc 编不过它）；
+2. `./configure --target=aarch64-apple-darwin --prefix=/opt/ld64 --with-libdispatch=/usr/local`
+   + `make && make install` → `/opt/ld64/bin/aarch64-apple-darwin-ld`（ld64-956.6）；
+3. 新脚本 `tools/relink64.py`：用 CI 的 `xnu-objects` 做底座、`--local 源文件=对象`
+   替换掉本地重编的那几个，再用真 `ld64` 链接 + `strip`。
+
+**验证**：本地链出来的内核 `__TEXT 0xfffffff007004000`、entry 正常、16.4 MB，
+`fastboot boot` 后 `SWEET AMFI registered` → `MKB_INIT` → `exec SpringBoard`，
+450 次 exec，与 CI 版行为一致。**一轮内核改动的验证从 30–60 分钟降到约 6 分钟。**
+
+### 22:50 两个决定性结论（写文件 vs launchd 时序）
+
+- 写入**确实生效**：`0248` 的校验行
+  `verify /System/Library/LaunchDaemons/...: mount / type hfs n=16 read 62706c69 want 62706c69`
+  —— 读回就是我们写的字节（`bpli` = 二进制 plist 头），时间 0.886 s；
+- 但 **launchd 在 0.288 s 就已经 exec 了**（`load_init_program` → `exec launchd`），
+  比我们任何 VFS 写入都早 → **"启动时替换 daemon plist"这条路先天赢不了**，
+  与写得好不好无关；
+- 顺带：`com.apple.purplebuddy.plist`（SetupDone=true）也装进去并校验通过，但日志里
+  依然没有 Setup/Buddy 进程，SpringBoard 行为不变。
+
+所以要让"替换系统文件"生效，只能走**持久化**（让文件在下次启动前就在盘上）——
+这需要 HFS 日志提交真正落盘（目前每次启动仍报 `1 written`，说明没持久化）。
