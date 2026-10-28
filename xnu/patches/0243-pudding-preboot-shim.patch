@@ -93,7 +93,7 @@ new file mode 100644
 index 0000000..0000000
 --- /dev/null
 +++ b/bsd/dev/pandora_preboot.c
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,238 @@
 +/*
 + * PANDORA preboot shim (patch 0243): make iOS 16 libignition's "preboot"
 + * stage succeed on an HFS+ root.
@@ -296,6 +296,12 @@ index 0000000..0000000
 +			printf("PANDORA PREBOOT: %s: error %d\n", path, error);
 +		}
 +	}
++
++	/* libignition's cryptex1 sniff does fstatat(preboot_root, "cryptex1"); with
++	 * ENOENT the stage returns 8 (the log said "cryptex1 sniff: ignition failed:
++	 * 8") and ignition stops there. */
++	(void)pandora_mkdir("/private/preboot/cryptex1", 0755);
++	(void)pandora_mkdir("/private/preboot/cryptex1/current", 0755);
 +
 +	snprintf(path, sizeof(path), "/private/preboot/%s/.roots-installed", hex);
 +	error = pandora_touch(path, 0644);
