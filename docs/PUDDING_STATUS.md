@@ -361,3 +361,24 @@ sig 5 code 0x600000001 ... reason ns 2 code 0x5`），12 次后 launchd 报
 2. 或者预置一个"已激活"状态（activation record / mad 目录），再看 SpringBoard
    是否直接进桌面。
 3. 无论哪条，内核侧不再需要改动 —— 启动链已经打通。
+
+### 20:45 重要发现：改用户态文件**不需要新内核**
+
+`bsd/dev/pandora_files.c` 的固件包格式本来就支持把任意文件装到任意路径：
+包里放一份 `files.txt`，每行 `包内名 权限 /绝对路径`（`- 权限 /路径` 表示建目录），
+内核线程在根卷挂载后 2 s 把这些文件写进去（走 VFS，HFS 日志一致）。
+现在的包只有一行：
+`systembag.kb 0600 /private/var/keybags/systembag.kb`。
+
+也就是说，下一步激活相关的实验（例如替换
+`/System/Library/LaunchDaemons/com.apple.mobileactivationd.plist`、
+预置 mad/activation 记录）**只需要重新打包 + 原地重写那个 2 MiB 的 pinned 文件**，
+不用改内核、不用等 CI：
+
+1. `python3 data-a-live/tools/mkfwpack.py pack/iosfw.img <文件...>`（包内再放一份新 `files.txt`）
+2. `pinfile create` 已存在 → 直接 `rawwrite` 覆盖同一文件（extents 不变，ADT 不用重做）
+3. `fastboot boot` 现有内核即可
+
+限制：pinned 文件是 2 MiB（`PF_MAX_FILE` 也限制单文件大小），换 2.4 MB 的
+`mobileactivationd` 二进制放不下 —— 要么换成小体积的 plist/记录，要么以后把
+pinned 文件扩大。
