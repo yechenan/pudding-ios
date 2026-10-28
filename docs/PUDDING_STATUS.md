@@ -691,3 +691,27 @@ SpringBoard 不再有任何动作。
 
 正在跑的 run5 在 300 / 650 / 1000 / 1350 s 各打一次全线程表，用来对比
 "SpringBoard 起来之前/之后" 各自卡在哪个 mach 端口或内核等待上。
+
+### 04:15 又一个"上一轮的实验污染了镜像"：mobileactivationd 一直是 `/usr/bin/true`
+
+查 `run5` 的线程表时顺手翻了镜像里的 job 表，发现 **内嵌的
+`/System/Library/xpc/launchd.plist` 里 `com.apple.mobileactivationd` 的
+`ProgramArguments` 就是 `/usr/bin/true`，而且没有 `MachServices`** —— 这是更早那轮
+"把 mad 换成 true 看画面变不变"的实验留下的，它被写进了镜像并一直留着。
+
+也就是说：**从那一轮之后，这台机器上根本没有激活服务**，`com.apple.mobileactivationd`
+和 `.lockdown` 两个 Mach 服务都不存在。上一轮得出的"卡点不在激活服务"的结论，
+是在 180 秒的窗口下得到的 —— 而那时系统连 SpringBoard 都还没到，所以那个结论不成立。
+
+已修（`tools/root_tweaks.py` 现在从 `ios-root.orig.img` 的原始 job 表出发）：
+
+- 内嵌 job 表：`ProgramArguments = /usr/libexec/mobileactivationd`，
+  `MachServices = {com.apple.mobileactivationd, com.apple.mobileactivationd.lockdown}`；
+- `/System/Library/LaunchDaemons/com.apple.mobileactivationd.plist` 同样恢复；
+- 其余 tweaks（`_PanicOnCrasX` 7 个、去掉两个 CommCenter job、530 个 job）保持一致。
+
+ADT 里已经有 `certificate-security-mode` / `effective-security-mode-{ap,sep}`，
+正是 `mkadt_pandora.py` 注释里说的、让 mobileactivationd 走 "Hactivation" 分支
+（本地激活、不联系苹果服务器）的那组属性；之前只是因为服务根本没跑，这组属性没用上。
+
+run6 就用这个镜像跑，看 SpringBoard 的锁屏会不会真的出现。
