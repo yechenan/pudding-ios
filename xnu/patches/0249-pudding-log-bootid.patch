@@ -1,0 +1,99 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -1831,8 +1831,17 @@
+  * Returns the byte count; *pos advances.
+  */
+ uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);
+ 
++/* 0249: upstream's 0258 gives the final drain a copy that goes up to every byte
++ * taken, not only the ones a writer finished storing.  Our sweet_log_copy
++ * already reads sweet_log_total, so it is the same read under either name. */
++uint32_t
++sweet_log_copy_any(uint64_t *pos, char *out, uint32_t max)
++{
++	return sweet_log_copy(pos, out, max);
++}
++
+ uint32_t
+ sweet_log_copy(uint64_t *pos, char *out, uint32_t max)
+ {
+ 	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
+@@ -1858,8 +1867,14 @@
+ struct sweet_log_header {
+ 	char magic[8];
+ 	uint32_t version, size;
+ 	uint64_t total, seq;
++	/* 0249: v2 appends these; v1 readers stop after seq. */
++	uint64_t boot_id;          /* epoch seconds at the first log byte */
++	uint64_t completed;        /* last total written and synced */
++	uint32_t restart_type;     /* PEHaltRestart type that ended this boot */
++	uint32_t pad0;
++	uint64_t restart_uptime;   /* uptime in ns when that restart began */
+ };
+ 
+ static void
+ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+@@ -1950,8 +1965,12 @@
+ #define PL_RING_BLOCKS  (SWEET_LOG_SIZE / UFS_BLOCK)
+ 
+ static bool pl_ready;
+ static uint64_t pl_flushed, pl_seq;
++static uint64_t pl_boot_id;          /* 0249 */
++static uint64_t pl_completed;        /* 0249 */
++static uint32_t pl_restart_type;     /* 0249: 0 while the boot is running */
++static uint64_t pl_restart_uptime;   /* 0249 */
+ static int pl_chan;
+ 
+ static void
+ pl_psci_reset(void)
+@@ -1990,9 +2009,11 @@
+ 	}
+ 	if (!error) {
+ 		struct sweet_log_header h = {
+ 			.magic = { 'P', 'A', 'N', 'D', 'O', 'R', 'L', 'G' },
+-			.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++pl_seq,
++			.version = 2, .size = SWEET_LOG_SIZE, .total = total, .seq = ++pl_seq,
++			.boot_id = pl_boot_id, .completed = total,
++			.restart_type = pl_restart_type, .restart_uptime = pl_restart_uptime,
+ 		};
+ 		uint64_t lba, run;
+ 		if (!pl_map(0, &lba, &run)) {
+ 			return EINVAL;
+@@ -2073,8 +2094,11 @@
+ 	if (type != 0 && type != 1 && type != 4 && type != 9) {
+ 		return 0;
+ 	}
+ 	if (pl_ready) {
++		/* 0249: record the restart before the last flush writes the header. */
++		pl_restart_type = type;
++		clock_get_uptime(&pl_restart_uptime);
+ 		/* Everything else is stopped (panic) or going down: no lock. Let a command
+ 		 * still in slot 0 finish first. */
+ 		for (int i = 0; i < 100000 && (ufs_rd(REG_UTRLDBR) & 1); i++) {
+ 			delay(1);
+@@ -2193,12 +2217,20 @@
+ pandora_log_start(void)
+ {
+ 	thread_t thread;
+ 	PE_halt_restart = pandora_halt_restart;
+-	clock_sec_t secs = 0;
+-	clock_usec_t usecs = 0;
+-	clock_get_calendar_microtime(&secs, &usecs);
+-	pl_boot_id = (uint64_t)secs;
++	/* 0249: boot id counts boots, not wall clock (this kernel has no RTC before the
++	 * userspace clock is set): read the header left by the previous boot and add one. */
++	uint64_t lba0, run0;
++	if (pl_map(0, &lba0, &run0) && ufs_read_blocks(lba0, 1) == 0) {
++		struct sweet_log_header *prev = (struct sweet_log_header *)(su.dma + DMA_BOUNCE);
++		if (memcmp(prev->magic, "PANDORLG", 8) == 0) {
++			pl_boot_id = prev->boot_id + 1;
++		}
++	}
++	if (pl_boot_id == 0) {
++		pl_boot_id = 1;
++	}
+ 	if (pl_next == 0 || !su.writable) {
+ 		printf("PANDORA LOG: no log file (%u extents, writable %d); restart hook only\n",
+ 		    pl_next, su.writable);
+ 		return;

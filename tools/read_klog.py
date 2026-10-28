@@ -33,6 +33,20 @@ import pandora_log  # noqa: E402
 
 version, size, total, seq, text = pandora_log.decode(raw)
 print(f"header v{version} ring {size} total {total} seq {seq}", file=sys.stderr)
+
+# 0249: v2 appends the boot id, a completion mark and the restart record.
+if version >= 2 and len(raw) >= 64:
+    import struct
+    import time
+    boot_id, completed = struct.unpack_from("<QQ", raw, 32)
+    rtype, = struct.unpack_from("<I", raw, 48)
+    rup, = struct.unpack_from("<Q", raw, 56)
+    print("boot %s  completed %d/%d%s  restart %s%s" % (
+        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(boot_id)) if boot_id else "?",
+        completed, total, "" if completed == total else "  (LOG CUT SHORT)",
+        {0: "none (still running)", 1: "kPERestartCPU", 4: "kPEPanicRestartCPU",
+         9: "kPEPanicRestartCPUNoCallouts"}.get(rtype, str(rtype)),
+        "  at %.1f s" % (rup / 1e9) if rtype else ""), file=sys.stderr)
 dest = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "pudding-hw", "ioslog.txt")
 with open(dest, "wb") as f:
     f.write(text)
