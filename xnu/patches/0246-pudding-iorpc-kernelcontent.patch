@@ -1,0 +1,17 @@
+diff --git a/iokit/IOKit/IORPC.h b/iokit/IOKit/IORPC.h
+--- a/iokit/IOKit/IORPC.h
++++ b/iokit/IOKit/IORPC.h
+@@ -223,8 +223,13 @@
+ 	IORPCMessageMach * message;
+ 	IORPCMessageMach * reply;
+ 	uint32_t           sendSize;
+ 	uint32_t           replySize;
++	/* Xcode 16 and later iig always fills and reads this; Xcode 15 does not.
++	 * A trailing pointer keeps the layout of the four fields above, and the
++	 * one designated initialiser in IOUserServer.cpp leaves it NULL for the
++	 * kernel objects that never see kernel-originated content. */
++	IORPCMessage      * kernelContent;
+ };
+ typedef struct IORPC IORPC;
+ 
+ enum {

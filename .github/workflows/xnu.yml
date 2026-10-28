@@ -82,6 +82,9 @@ jobs:
           # Prefer Xcode 15: its iig matches the xnu-8796 IORPC ABI; fall back
           # to the newest installed Xcode if 15 is absent.
           XC=$(ls -d /Applications/Xcode_15*.app 2>/dev/null | sort -V | head -1)
+          # No Xcode 15 (macos-15 images): 16.x is the closest iig.  Patch 0246
+          # gives IORPC the kernelContent member those iigs emit.
+          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1)
           [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
           echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
           sudo xcode-select -s "$XC"
