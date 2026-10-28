@@ -7,13 +7,13 @@ diff --git a/bsd/kern/kern_sysctl.c b/bsd/kern/kern_sysctl.c
  
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +	/*
-+	 * SWEET boots an HFS+ root: there is no APFS preboot volume for
-+	 * IOGetApfsPrebootUUID to report.  iOS 16's libignition asks for this
-+	 * before it mounts the cryptexes and aborts ignition ("failed to lookup
-+	 * preboot: 25") when it is missing, so hand it a stable, valid UUID.
++	 * SWEET boots an HFS+ root: no APFS preboot volume exists, so
++	 * IOGetApfsPrebootUUID reports nothing and iOS 16's libignition aborts
++	 * ignition ("failed to lookup preboot").  Hand it a valid UUID.
 +	 */
 +	if (error) {
-+		strlcpy(uuid_string, "00000000-0000-0000-0000-000000000001", sizeof uuid_string);
++		static const char sweet_preboot[] = "00000000-0000-0000-0000-000000000001";
++		memcpy(uuid_string, sweet_preboot, sizeof sweet_preboot);
 +		error = sysctl_io_string(req, uuid_string, 0, 0, NULL);
 +	}
 +#endif
