@@ -58,9 +58,11 @@ sudo rsync -aH "$mnt/app/" "$mnt/dst/private/preboot/Cryptexes/App/"
 # or, on iOS 16, /System/Cryptexes/OS/System/Library/Caches/com.apple.dyld/.
 # Give it both: a symlink for the cryptex mount point and a hard link at the
 # legacy path (no extra space). sudo: the cryptex files are root-only.
-echo "dyld caches on the three volumes:"
-sudo find "$mnt/os" "$mnt/sys" "$mnt/app" -name 'dyld_shared_cache*' -printf '  %p %s
-' 2>/dev/null | head -20 || true
+# BSD find has no -printf, and `find | head` trips pipefail on SIGPIPE: capture first.
+echo "dyld caches on the volumes:"
+caches=$(sudo find "$mnt/os" "$mnt/sys" -name 'dyld_shared_cache*' 2>/dev/null || true)
+printf '%s
+' "$caches" | sed -n '1,10p'
 
 cache=$(sudo find "$mnt/dst" -name 'dyld_shared_cache_arm64e' -print -quit 2>/dev/null || true)
 if [ -n "$cache" ]; then

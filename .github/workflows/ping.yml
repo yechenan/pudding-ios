@@ -7,6 +7,11 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
+      - run: echo "linux ok"
+  macos:
+    runs-on: macos-14
+    steps:
       - run: |
-          echo "linux runner ok"
-          uname -a
+          echo "macos ok"
+          sw_vers
+          xcodebuild -version
