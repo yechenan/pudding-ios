@@ -86,3 +86,28 @@ IORegistryEntry::fromPath("/chosen", gIODTPlane)->getProperty("apfs-preboot-uuid
 3. 内核补丁 0242（改 sysctl）可保留也可删——它不是 libignition 走的那条路。
 
 这样 `get_preboot_uuid()`、libignition 的 IOKit 查询、BindFS 的路径拼接三处会同时对齐。
+
+### 2026-10-28 验证：ADT 的 apfs-preboot-uuid 不解决问题
+
+在 `/chosen` 里加了 `apfs-preboot-uuid` 后重启，libignition 仍然：
+
+```
+libignition: preboot: mounting preboot
+libignition: failed to lookup preboot: 25
+libignition: preboot: failed to get preboot device: 25
+```
+
+而且 BindFS 用的 UUID 是 `5CBE3601…`（长哈希，与 ADT 里设的常量不同）。
+
+结论：**libignition 要找的是一个 preboot "设备"（IOKit IOService/IOMedia），不是一个 UUID 属性。**
+HFSX 根上没有这类设备，所以返回 ENOTSUP(25)。
+
+### 下一步的两个方向
+
+1. **在 IOKit 里造一个虚拟 preboot 设备**（SWEET 内核里 publish 一个带 preboot 角色的 IOService/IOMedia，
+   让 libignition 的 IOService 匹配成功）——工作量中等，需要读 libignition 的匹配条件；
+2. **绕过 libignition**：它只是启动序列的一部分，可以尝试让 launchd 以 `-x`/单用户等模式跳过
+   （需确认 launchd 的参数支持），或 patch launchd 的启动路径——但二进制补丁需要 HFS 写能力。
+
+在动手之前，先确认 libignition 到底匹配什么：从 IPSW 的 dyld 缓存里反汇编 `libignition_core`
+或 `libignition.dylib` 的 preboot 查找函数，看它用的 IOKit 类名/属性。
