@@ -588,3 +588,35 @@ mount`，按启动次序统计：
 另外 `tools/prepare_run.sh KERNEL OUTDIR WINDOW "额外启动参数"` 把
 "读当前 extents → 生成 ADT（带 D22AP 的 /product）→ 建 boot 镜像 → 校验 cmdline"
 合成一条命令；f2fs 会在文件被重写后换位置，所以每次跑之前都重建 ADT，不再复用旧镜像。
+
+## 2026-10-29 02:00 镜像缺的东西找到了：ios-sweet 的 root tweaks
+
+读上游 `dipa-studio/ios-sweet` 的 `tools/sweet-root-tweaks.py`（就是把他们的镜像从
+"苹果 logo 永远不动"推进到桌面的那个脚本），对照我们的镜像逐条查，缺了这些：
+
+| 项目 | 上游做法 | 我们的镜像 |
+|---|---|---|
+| `/private/var/containers` | 建 `Bundle`(33:33)、`Data/System`、`Shared/SystemGroup`、`Temp`（iOS 上在数据卷，不在 `mobile/` 下） | **整个目录都不存在** |
+| `launchd.plist` | `_PanicOnCrash` → `_PanicOnCrasX`（崩溃的 daemon 不能把整机 panic）；删掉 `com.apple.CommCenter` 的两个 job | 7 个 `_PanicOnCrash` 原样、CommCenter 在（日志里 CommCenter 崩了 53 次） |
+| 数据迁移 | `com.apple.migration` 写 `LastSystemVersion=20H392`，否则每次开机跑一小时 | 没有，日志里 migration 一次启动跑 3 次（43 s / 829 s / 887 s） |
+| SpringBoard | `BKNoWatchdogs`、关掉 cloud configuration UI | 没有 |
+| Setup | `purplebuddy` 的 `SetupDone` 等一整套 | 只有一个 `SetupDone` 的 plist |
+| 音频 | `VirtualAudio.plugin` 移走（mediaserverd 崩）、MediaToolbox `StartRecorderServer=false` | 都还在 |
+
+上游脚本对 CommCenter 的注释是关键线索：**"没有基带，它崩溃循环，而 Setup 会阻塞在它的
+CoreTelephony XPC 上"** —— 这和我们的现象对得上：屏幕停在启动进度条、CommCenter 反复崩、
+SpringBoard 不再有任何动作。
+
+已按上游脚本逐条移植（`tools/root_tweaks.py`，输出 `out/tweaks/`，再用 guestfish 写进镜像）：
+
+- `launchd.plist`：530 个 job（原 532），`_PanicOnCrasX` 7 个；
+- `/private/var/containers/{Bundle 33:33, Data/System, Shared/SystemGroup, Temp}`；
+- 5 个偏好 plist（mobile 501:501, 0600）；
+- `VirtualAudio.plugin` → `HAL.disabled/`，MediaToolbox 两份 SubServerConfiguration `StartRecorderServer=false`。
+
+没做的一条：`mobileactivationd` 的 data ark。上游是**在已有的系统容器里**写
+`data_ark.plist`（`-ActivationState=Activated`），而我们的镜像里连
+`containers/Data/System` 都是刚建的、没有 `com.apple.mobileactivationd` 容器，所以先跳过。
+
+镜像写好后用 `tools/restore_root.sh` 把它 rawwrite 回手机（extents 不变，ADT 不用重建），
+再跑一轮 1500 s 的启动。
