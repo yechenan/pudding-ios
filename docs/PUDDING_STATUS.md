@@ -798,3 +798,50 @@ SpringBoard: 1000 s 13 个线程，1900 s 12 个（少了一个，说明还有�
 内核有完整的 VFS，加一个 boot-arg 的"定时把某个文件的内容打进内核日志"（`pandora_cat=路径:秒数`）
 是很小的改动，却能让以后所有"进程不动了"的问题都有栈可看。这比继续猜 10-bit surface /
 海报 / 激活都更值。
+
+## 2026-10-29 05:40 **找到卡点：SpringBoard 在死循环重试 `com.apple.commcenter.xpc`**
+
+### 怎么找到的：把跑完的镜像拉回来读 launchd 的日志
+
+iOS 的 launchd 会把每个 job 的生命周期写进
+`/private/var/log/com.apple.xpc.launchd/launchd.log`，而且**这个文件是持久化的**（HFS 写入这次
+真的落盘了）。于是：
+
+```
+pinfile rawread /data/local/tmp/iosroot-pin.img <userdata dev> > run.img   # 16 GiB，13 分钟
+# 去掉 pinfile 自己的 190 字节前言，guestfish 只读挂载，把 launchd.log 拷出来
+```
+
+拿到 **4 MB** 的 `launchd.log`，里面有每一次 spawn / exit / lookup。
+
+### 日志说了什么
+
+```
+16:00:24  (user/501/com.apple.SpringBoard [25]) service spawned with pid 25
+...
+16:14:01  failed lookup: name = com.apple.commcenter.xpc, requestor = SpringBoard[25], error = 3: No such process
+16:14:02  failed lookup: ... 同上
+...       （每秒一次，一直到 16:39:53 最后一条，共 1538 次）
+```
+
+统计（整份日志）：
+
+| 次数 | 服务名 | 请求者 |
+|---|---|---|
+| 4327 | `com.apple.commcenter.coretelephony.xpc` | vmd[405] |
+| **1538** | **`com.apple.commcenter.xpc`** | **SpringBoard[25]** |
+| 84 | `com.apple.mobileactivationd` | lsd[98] |
+| 16 | `com.apple.wifi.manager` | SpringBoard[25] |
+
+也就是说：**SpringBoard 起来之后卡在一个每秒重试的 XPC 查找上**，而那个服务正是我们按
+ios-sweet 的 tweak 删掉的 `com.apple.CommCenter`（上游删它是因为"没有基带时它会崩、Setup 会
+阻塞在它的 CoreTelephony XPC 上"——但我们的流程跳过了 Setup，反而轮到 SpringBoard 卡住）。
+
+顺带确认：SpringBoard 其实 **24 秒就起来了**（`service spawned with pid 25`），
+`|SpringBoard|` 日志到 835 秒才出现是因为它一直在等启动进度。
+
+### 处理
+
+`tools/root_tweaks.py` 加了 `PD_KEEP_COMMCENTER=1`：保留两个 `com.apple.CommCenter` job
+（MachServices 才会注册），其余 tweaks 不变。run8 用它跑，看 SpringBoard 是否终于把第一帧交给
+合成器。
