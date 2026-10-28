@@ -305,3 +305,25 @@ IOService**，于是 loader abort，随后内核 panic（panic 文本没进日�
 可以链接成功（20.9 MB），但 LLVM 18 的 `ld64.lld` 明确没有实现
 `-image_base` / `-segaddr`，所有段落落在 `0x0`，而内核必须链在
 `0xfffffff007004000` —— 产物不可启动，这条路只适合验证"能不能过编译/链接"。
+
+## 2026-10-28 19:57 —— AMFI 墙过了，SpringBoard 起来了
+
+新内核（run `40678846332`，commit `3739e4e7`：0243 preboot+AMFI 发布+重试、0244 AMFI
+服务、0246 IORPC.kernelContent，0245 已删）真机启动结果：
+
+- `[0.230] SWEET AMFI: AppleMobileFileIntegrity registered`
+- `[12.135] launchd_cache_loader` **不再 abort**（上一轮就是死在这里）
+- `[12.291] exec SpringBoard` / `[12.347] exec backboardd`，backboardd 正常打开
+  `AppleKeyStore`（`SWEET AKS` 系列）
+- `[13.902] SWEET AMFI: sel 9 unsupported` —— loader 用了 selector 9，我们返回
+  unsupported 后它照样继续（不影响）
+- 全程 **497 次 exec**，帧缓冲在动画：`SWEET FB: stats 600 frames in 5000 ms ...
+  119.9 fps`、`14000 swaps`
+- 一直是 180 s 后由 `pandora_reboot_after` 主动重启，**没有 panic、没有挂死**
+
+日志：`out/ioslog-amfi.txt`（196 KB，上一轮只有 55 KB）。
+
+**当前唯一卡点**：`mobileactivationd` 起来就 `SIGTRAP`（`CRASH mobileactivation[..]
+sig 5 code 0x600000001 ... reason ns 2 code 0x5`），12 次后 launchd 报
+"Too many corpses being created"。pc 每次都落在同一个偏移，是确定性断言而不是偶发。
+下一步就是处理激活状态（或者让 mobileactivationd 认为设备已激活）。

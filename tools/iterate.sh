@@ -9,7 +9,7 @@
 # the kernel log.  Prints the lines that matter for the current bring-up.
 set -euo pipefail
 
-root=$(cd "$(dirname "$0")/.." && pwd)
+root=$(cd "$(dirname "$0")/../.." && pwd)   # workspace root: holds data-a-live, pack, .gh_token, tools
 run=${1:?run id}
 adt=${2:-$root/boot-new/adt-fw.adt}
 out=${3:-$root/out/run-$run}
