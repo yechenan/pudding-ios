@@ -845,3 +845,36 @@ ios-sweet 的 tweak 删掉的 `com.apple.CommCenter`（上游删它是因为"没
 `tools/root_tweaks.py` 加了 `PD_KEEP_COMMCENTER=1`：保留两个 `com.apple.CommCenter` job
 （MachServices 才会注册），其余 tweaks 不变。run8 用它跑，看 SpringBoard 是否终于把第一帧交给
 合成器。
+
+## 2026-10-29 06:15 **过了锁屏这道墙：屏幕上是 Setup 的 "hello"**
+
+run8 = run7 的镜像 + **把两个 `com.apple.CommCenter` job 加回去**（`PD_KEEP_COMMCENTER=1`）。
+
+结果：
+
+```
+display: on 53.7s, off 1017.7s            ← 系统自己把屏幕睡掉了（说明电源管理在工作）
+presents: 16（last 846.9s）
+screen timeline: 132..852 = logo（不变）
+                 972 = 变了！bright 71 → 5
+                 1092 之后 = 全黑（屏幕已睡）
+```
+
+972 秒那一帧的缩略图和 998 秒的完整帧转储（`out/run8-surface.png`）显示的是
+**iOS Setup 的 hello 界面**：右上角状态栏（电池）、底部 Home 指示条、右下角按钮，
+中间是 "hello" 的笔迹动画。也就是说：
+
+- SpringBoard 真的在渲染；
+- 系统已经走完了启动 → 锁屏这一层，现在停在**首次开机设置（Setup.app）**；
+- 之前"SpringBoard 起了但画面不动"就是被 `com.apple.commcenter.xpc` 的每秒重试卡住的。
+
+顺带把固件包换回 keybag-only（`pack/iosfw.img`），不再每次开机把
+`mobileactivationd` 的 plist 覆盖成 `/usr/bin/true`。
+
+### run9（正在跑）：把真 mobileactivationd 也放回去
+
+Setup 停在 hello 很可能是因为**设备没被"激活"**。之前 mad 一跑就崩（`copyReverseProxyDictionary`
+里 `brk #0x1`），但那次崩溃时 CommCenter 是被删掉的；现在 CommCenter 的 MachServices 注册上了，
+mad 的代理/网络路径可能就能过。run9 = run8 + 真 mad（`PD_KEEP_MAD=1`）。
+
+如果 run9 的 Setup 直接跳过、进到锁屏，那"从 logo 到锁屏"这条主线就通了。
