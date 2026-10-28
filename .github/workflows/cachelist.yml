@@ -29,11 +29,11 @@ jobs:
         run: |
           for v in os sys app; do
             echo "=== /tmp/$v/System/Library/Caches/com.apple.dyld"
-            ls -l "/tmp/$v/System/Library/Caches/com.apple.dyld" 2>&1 | head -20
+            ls -l "/tmp/$v/System/Library/Caches/com.apple.dyld" 2>&1 | head -20 || true
             echo "=== /tmp/$v/System/Cryptexes"
-            ls -l "/tmp/$v/System/Cryptexes" 2>&1 | head -10
+            ls -l "/tmp/$v/System/Cryptexes" 2>&1 | head -10 || true
             echo "=== /tmp/$v/sbin/launchd"
-            ls -l "/tmp/$v/sbin/launchd" 2>&1
+            ls -l "/tmp/$v/sbin/launchd" 2>&1 || true
             echo
           done
 
