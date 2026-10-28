@@ -66,3 +66,23 @@ libignition 查 preboot 走 **IOKit 的 `IOGetApfsPrebootUUID`**（不是 `kern.
 
 - dyld 缓存必须链到 `/System/Library/Caches/com.apple.dyld/`，文件是 `dyld_shared_cache_arm64`（**不是 arm64e**），且要用 **iOS 的**那份，不能用 `System/DriverKit/...`；
 - 缓存文件的 uid 必须是 0（macOS 建镜像要 `hdiutil attach -owners on`），否则 `shared_region_map` 报 `owned by uid=501`。
+
+### preboot UUID 的正确做法（2026-10-28 定位）
+
+`IOGetApfsPrebootUUID()`（`iokit/bsddev/IOKitBSDInit.cpp`）的实现是：
+
+```c
+IORegistryEntry::fromPath("/chosen", gIODTPlane)->getProperty("apfs-preboot-uuid")
+```
+
+**它读的是设备树里 `/chosen/apfs-preboot-uuid` 这个属性**，不需要改内核。
+
+因此正确修法是：
+
+1. ADT 的 `/chosen` 下加 `apfs-preboot-uuid = "00000000-0000-0000-0000-000000000001"`；
+2. 镜像里按同一个 UUID 建
+   `/private/preboot/00000000-0000-0000-0000-000000000001/usr/standalone/firmware`
+   和同目录下的 `.roots-installed`；
+3. 内核补丁 0242（改 sysctl）可保留也可删——它不是 libignition 走的那条路。
+
+这样 `get_preboot_uuid()`、libignition 的 IOKit 查询、BindFS 的路径拼接三处会同时对齐。
