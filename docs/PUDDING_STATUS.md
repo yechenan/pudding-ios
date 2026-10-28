@@ -715,3 +715,61 @@ ADT 里已经有 `certificate-security-mode` / `effective-security-mode-{ap,sep}
 （本地激活、不联系苹果服务器）的那组属性；之前只是因为服务根本没跑，这组属性没用上。
 
 run6 就用这个镜像跑，看 SpringBoard 的锁屏会不会真的出现。
+
+## 2026-10-29 夜间无人值守总结（00:16 → 05:30）
+
+### 一句话
+
+「卡在苹果 logo」是两个假象叠出来的：**窗口太短**（iOS 侧启动要 ~14 分钟）和**镜像根本不全**
+（少了 ios-sweet 的整组 root tweaks）；补齐之后 **SpringBoard 真的会起来、锁屏控制器会被创建**，
+现在卡在「SpringBoard 起了但画面不被合成」。
+
+### 今晚确认的事实（按重要性）
+
+1. **启动要 14 分钟，不是卡死**：进度条 59 s 0% → 365 s 49% → 815 s 83%；
+   828 s 一批服务（installd / appstored / assetsd / migrationpluginwrapper / 海报扩展…）
+   同时启动 —— 那才是"启动完成"。`pandora_reboot_after` 必须 ≥1500 s。
+2. **镜像缺 ios-sweet 的 root tweaks**：`/private/var/containers` 整棵树、`launchd.plist` 的
+   `_PanicOnCrasX` 重命名与 CommCenter 移除、`com.apple.migration` 的 `LastSystemVersion`、
+   SpringBoard 的 `BKNoWatchdogs`、Setup 跳过、VirtualAudio 关掉。补齐后 **SpringBoard 从
+   "0 行日志"变成 410 行，并在 835 s 创建 `SBCoverSheetPrimarySlidingViewController`（锁屏）**。
+3. **补 containers 之后 HFS 的运行时损坏消失了**：`hfs_mark_inconsistent` 从 327 条 → 0 条。
+4. **`/data/local/tmp` 是 FBE 加密的**：`adb push` 写的镜像在裸块上是密文，必须
+   `pinfile rawwrite`（16 GiB 约 1 分 50 秒）。`pinfile create` 会把文件 pin 住，`adb push`
+   覆盖同一路径会换 inode、丢 pin、换 extents。
+5. **mobileactivationd 从 828 s 起就被我们自己的实验桩掉了**（内嵌 job 表里是 `/usr/bin/true`）。
+   恢复真身之后它照旧在 13.5 s 崩（同一 pc，`brk #0x1` 断言，424 次），所以目前又桩回去了。
+6. **帧缓冲只有 7 次 present**：6 次在 53.6 s（backboardd 自己的启动 UI），第 7 次在 836 s；
+   之后 SpringBoard 的内容再也没被合成。注入电源键/上滑/音量键**完全没有反应**
+   （`display_off` 始终 0，缩略图逐字节不变）。
+
+### 现在手上的工具（都跑通了）
+
+| 工具 | 用途 |
+|---|---|
+| `tools/run_boot.sh IMG NAME SECS` | 一轮无人值守：fastboot boot → 等自动回安卓 → 拉 pinned 日志 → 解码 → 帧转储 |
+| `tools/prepare_run.sh KERNEL OUTDIR WINDOW "额外参数"` | 读当前 extents → 重建 ADT（带 D22AP /product）→ 建 boot 镜像 |
+| `tools/restore_root.sh [IMG]` | push 到 scratch → `pinfile rawwrite` 写回 pinned 文件（extents 不变，ADT 不用重建） |
+| `tools/root_tweaks.py out/tweaks` | 从**原始** job 表生成 tweaks：`_PanicOnCrasX`、去 CommCenter、containers、偏好、音频 |
+| `tools/thumbs.py LOG OUTDIR` | 把日志里的 60×130 ASCII 屏幕缩略图渲染成 PNG |
+| 内核 `0250` | `pandora_thumbs_start/_every`：每 N 秒一张屏幕缩略图进日志 |
+| 内核 `0251/0252` | `pandora_ps=SECONDS` / `_every`：全进程/全线程表（pid/ppid/stat/uu_arg/wmesg） |
+
+### 当前状态（run7 正在跑）
+
+- 镜像：`pudding-hw/rootfs/ios-root.img`（tweaks 打满、mad 桩回去）；
+- 内核：`relink/kernel-0252`（0250 缩略图 + 0251 线程表）；
+- 本轮：`pandora_reboot_after=2400`，缩略图每 120 s，线程表在 1000/1900 s。
+
+### 明早可以接着做的（按性价比）
+
+1. **看 run7 的结果**：如果 1500 s 之后锁屏终于出现 → 就是"还是太慢"；若仍是静态 logo →
+   走下面 2。
+2. **SpringBoard 卡在合成**：最可能是 backboardd 在合成 SpringBoard 的 10-bit surface
+   （`fmt 0x77333072` = `'w30r'`）时卡住。两个方向：
+   - 让系统选 8-bit（改 iPhone X 的广色域声明 / AppleCLCD 的显示属性）；
+   - 或者在内核的 present() 里打印/转码 10-bit 图层，先确认是不是格式问题。
+3. **homed 反复崩**（40–600 次，`sig 6`）：SpringBoard 的首屏布局依赖它；如果能修 homed
+   的断言，锁屏/桌面可能一起解决。
+4. **激活**：mad 的断言在 `copyReverseProxyDictionary`（网络代理字典），可以试
+   给镜像补一份 `SystemConfiguration/preferences.plist`（ios-sweet v15 的做法）。
