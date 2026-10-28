@@ -40,7 +40,11 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/ShueiTSuki/data-a-live /tmp/upstream
           cp /tmp/upstream/xnu/patches/*.patch xnu/patches/
+          # The staging scripts (.sh) are part of the patch set: 0020-stage-bearssl.sh
+          # vendors BearSSL and the libkern/crypto includes fail without it.
+          cp /tmp/upstream/xnu/patches/*.sh xnu/patches/ || true
           ls xnu/patches/*.patch | wc -l
+          ls xnu/patches/*.sh | wc -l
           ls xnu/patches/0241* || true
 
       - name: Fetch build script
