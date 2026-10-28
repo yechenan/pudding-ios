@@ -1,0 +1,54 @@
+name: cachelist
+
+# List what the iOS 16.7.16 images actually contain under
+# System/Library/Caches/com.apple.dyld — the path dyld opens for libSystem.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  list:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Download IPSW
+        run: |
+          URL=$(curl -s --retry 3 https://api.ipsw.me/v4/device/iPhone10,3?type=ipsw | \
+            python3 -c "import sys,json;d=json.load(sys.stdin);print([f['url'] for f in d['firmwares'] if f['version']=='16.7.16'][0])")
+          curl -L --retry 3 -o /tmp/ios.ipsw "$URL"
+
+      - name: Mount the three DMGs
+        run: |
+          mkdir -p /tmp/dmg /tmp/os /tmp/sys /tmp/app
+          unzip -o -j /tmp/ios.ipsw '087-86698-044.dmg' '087-86593-047.dmg' '087-86715-047.dmg' -d /tmp/dmg
+          hdiutil attach -readonly -nobrowse -noverify -mountpoint /tmp/os  /tmp/dmg/087-86698-044.dmg
+          hdiutil attach -readonly -nobrowse -noverify -mountpoint /tmp/sys /tmp/dmg/087-86593-047.dmg
+          hdiutil attach -readonly -nobrowse -noverify -mountpoint /tmp/app /tmp/dmg/087-86715-047.dmg
+
+      - name: Report the dyld cache directories
+        run: |
+          for v in os sys app; do
+            echo "=== /tmp/$v/System/Library/Caches/com.apple.dyld"
+            ls -l "/tmp/$v/System/Library/Caches/com.apple.dyld" 2>&1 | head -20
+            echo "=== /tmp/$v/System/Cryptexes"
+            ls -l "/tmp/$v/System/Cryptexes" 2>&1 | head -10
+            echo "=== /tmp/$v/sbin/launchd"
+            ls -l "/tmp/$v/sbin/launchd" 2>&1
+            echo
+          done
+
+      - name: Any dyld cache anywhere
+        run: |
+          for v in os sys app; do
+            echo "=== volume $v"
+            find "/tmp/$v" -name 'dyld_shared_cache*' 2>/dev/null | sed -n '1,40p' | while read -r f; do
+              printf '%12s  %s\n' "$(stat -f %z "$f")" "$f"
+            done
+          done
+
+      - name: Detach
+        if: always()
+        run: |
+          hdiutil detach /tmp/os  || true
+          hdiutil detach /tmp/sys || true
+          hdiutil detach /tmp/app || true
