@@ -111,3 +111,55 @@ HFSX 根上没有这类设备，所以返回 ENOTSUP(25)。
 
 在动手之前，先确认 libignition 到底匹配什么：从 IPSW 的 dyld 缓存里反汇编 `libignition_core`
 或 `libignition.dylib` 的 preboot 查找函数，看它用的 IOKit 类名/属性。
+
+### 2026-10-28 反汇编结果：不是 IOKit，是 APFS 专用的 fsctl + sysctl
+
+先纠正上一条的猜测。libignition **不在独立的 dylib 里，而是静态链在 `/usr/lib/dyld` 中**
+（日志里的 `root:libignition-51~1974/libignition_core/RELEASE_ARM64`）。dyld 的符号表还留着
+`_ignition_get_devnode_by_role`、`_ignition_get_mount_point_by_role`、`__preboot_fire`。
+
+`__preboot_fire`（role = `0x10` = `VFS_PREBOOT_ROLE`）的顺序是：
+
+1. `_ignition_get_devnode_by_role(0x10, buf)` → 对 `"/"` 发
+   `fsctl(fd, 0xc1044a50, …)`，即 **`_IOWR('J', 80, 260)`**，缓冲区是
+   `struct { u8 op=2; u8 pad; u16 role; char devnode[256]; }`（260 字节）。
+   HFS+ 没有这个 APFS 命令，命令落到 `VNOP_IOCTL` 返回 **ENOTSUP(25)** ——
+   就是日志里的 `failed to lookup preboot: 25`。
+2. `_ignition_get_mount_point_by_role(0x10, path, &out)` → 读
+   **`sysctl vfs.generic.apfs.edt_fstab`**：一张 236（0xEC）字节一条的记录表，
+   挂载点字符串在 `+0x20`，`u32` 卷角色在 `+0xE8`，命中 role 后拷出路径。
+3. `open(mount_point, O_DIRECTORY…)` + `fmount("apfs", fd, MNT_DONTBROWSE, devnode, …)`。
+   **返回 `EBUSY(16)` 时它打印 "preboot already mounted"，并用已经打开的那个目录继续**；
+   只有错误不是 EBUSY 才算 ignition 失败。
+
+另外两点推翻了之前的判断：
+
+- **preboot 路径不是 UUID**，是 `/chosen/boot-manifest-hash` 的 96 位十六进制大写：
+  `5CBE36011D7D…5205` = `sha384("sweet boot manifest")`。bindfs、`mount -P 1`、launchd 的
+  `.roots-installed` cookie 都用这个值，所以改 `apfs-preboot-uuid` 当然没用。
+- **preboot 阶段失败并不致命**：日志里 `ignite() returned 25` 之后 launchd 照样跑到 11.9 s，
+  真正触发 `MACH Reboot` 的是 keybagd —— `/private/var/keybags/systembag.kb` 不存在，
+  `MKB_INIT: Can't load the keybag … Rebooting`。preboot 只是链路里靠前的一环。
+
+### 复现这套分析用的工具（本机可跑，不需要 macOS）
+
+- `tools/decode_ios_dmg.py`：iOS 16 的 restore DMG 是 UDIF + LZFSE 分块，尾部 plist 里有
+  每个分区的 `blkx`（mish）运行表；按运行表解码（0=空洞、1=原样、0x8000000x=LZFSE）就是原始
+  磁盘镜像。把文件当成"一串 LZFSE 流"解会在第一个全零区失步。
+- 解码后用 apfs-fuse 挂 `os.img -s 17408`，就能从 APFS 卷里直接取 `/usr/lib/dyld`。
+
+### 下一步（已实现，补丁 0243）
+
+内核里补齐这几件事，**不用重建 16 GiB 镜像**：
+
+1. `fsctl` 的 `'J', 80` 返回根设备 `/dev/ufsroot0`（role 16）；
+2. 注册 `vfs.generic.apfs.edt_fstab`，给出一条 role 16 → `/private/preboot` 的记录；
+3. 注册一个名叫 `apfs` 的 vfs，`mount` 直接返回 `EBUSY`，让 libignition 走
+   "already mounted" 分支；
+4. 首次查询时按 `/chosen/boot-manifest-hash` 建
+   `/private/preboot/<大写hex>/{usr/standalone/firmware,cryptex1}` 和 `.roots-installed`，
+   这样 bindfs 的 `mount -P 1` 和 launchd 的 cookie 检查也有东西可查。
+
+顺带修了 `xnu.yml`：`cp xnu/patches/*.patch xnu/patches/*.sh` 在没有 `.sh` 时会让整轮 CI 失败
+（最近三次 xnu 运行都是这样挂的）。
+

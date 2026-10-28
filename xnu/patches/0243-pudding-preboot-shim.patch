@@ -1,0 +1,306 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 091e113..2d6a61e 100755
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -125,6 +125,7 @@ bsd/dev/pandora_gpu.c			standard
+ bsd/dev/pandora_cpu.c			standard
+ bsd/dev/pandora_autoswipe.c		standard
+ bsd/dev/pandora_dpu.c			standard
++bsd/dev/pandora_preboot.c		standard
+ bsd/dev/adreno/ArmSmmu4K.c		standard
+ bsd/dev/adreno/ArmSmmu4KContext.c		standard
+ bsd/dev/adreno/ArmSmmu4KProgram.c		standard
+diff --git a/bsd/dev/pandora_preboot.c b/bsd/dev/pandora_preboot.c
+new file mode 100755
+index 0000000..d810b09
+--- /dev/null
++++ b/bsd/dev/pandora_preboot.c
+@@ -0,0 +1,207 @@
++/*
++ * PANDORA preboot shim (patch 0243): make iOS 16 libignition's "preboot"
++ * stage succeed on an HFS+ root.
++ *
++ * libignition lives inside /usr/lib/dyld and runs in-process when launchd
++ * starts.  Its __preboot_fire() asks the root filesystem two questions that
++ * only APFS answers:
++ *
++ *   1. fsctl("/", _IOWR('J', 80, 260), &args) with
++ *        struct { u8 op; u8 pad; u16 role; char devnode[256]; }
++ *      op 2 = "devnode for this volume role", role = VFS_PREBOOT_ROLE (16).
++ *      HFS+ has no such fsctl, so the command fell through to VNOP_IOCTL and
++ *      came back ENOTSUP -- the "failed to lookup preboot: 25" in the log.
++ *
++ *   2. sysctl "vfs.generic.apfs.edt_fstab": an array of 236-byte records with
++ *      the mount point string at +0x20 and the u32 volume role at +0xE8.
++ *      libignition scans it for role 16 and takes that path as the mount point.
++ *
++ * Then it opens the mount point and calls fmount("apfs", ...).  The "apfs" vfs
++ * registered here answers EBUSY, which libignition reports as "preboot already
++ * mounted" and carries on with the directory it already has -- exactly what we
++ * want, because in the pudding image /private/preboot is part of the HFS+ root.
++ *
++ * The tree libignition and mount -P expect is created here on the first
++ * lookup, named after /chosen/boot-manifest-hash (the same value bindfs and
++ * launchd build their paths from):
++ *
++ *   /private/preboot/<hash uppercase hex>/
++ *       .roots-installed
++ *       cryptex1
++ *       usr/standalone/firmware
++ *
++ * so the 16 GiB root image does not have to be rebuilt for it.
++ *
++ * The commands, the record layout and the role number were recovered from the
++ * binary: tools/ in the repo, docs/PUDDING_STATUS.md.
++ */
++#if defined(PANDORA)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/mount.h>
++#include <sys/mount_internal.h>
++#include <sys/sysctl.h>
++#include <sys/vnode.h>
++#include <sys/vnode_internal.h>
++#include <string.h>
++
++extern int pandora_mkdir(const char *path, int mode);          /* bsd/vfs/vfs_syscalls.c */
++extern bool IOGetBootManifestHash(char *hash, size_t *size);   /* iokit/bsddev/IOKitBSDInit.cpp */
++
++/* fsctl("/", _IOWR('J', 80, 260)): 260 = 2 + 2 + 256 */
++#define PANDORA_DEVNODE_BY_ROLE_CMD     0xc1044a50ul
++#define PANDORA_DEVNODE_OP_GET          2
++
++struct pandora_devnode_args {
++	uint8_t  da_op;
++	uint8_t  da_pad;
++	uint16_t da_role;
++	char     da_devnode[256];
++};
++
++/* One entry of vfs.generic.apfs.edt_fstab, as libignition reads it. */
++struct pandora_edt_fstab {
++	char     ef_reserved[0x20];
++	char     ef_mount_point[0xc8];
++	uint32_t ef_role;
++} __attribute__((packed));
++
++_Static_assert(sizeof(struct pandora_devnode_args) == 260, "libignition passes a 260-byte buffer");
++_Static_assert(sizeof(struct pandora_edt_fstab) == 0xec, "libignition walks 236-byte records");
++
++static boolean_t pandora_preboot_ready;
++
++/* The devnode and the mount point of a volume role.  Only the preboot volume
++ * exists here: the root is one HFS+ file system, so its own device node is the
++ * honest answer for role 16 and every other role is absent. */
++int
++pandora_preboot_fsctl(u_long cmd, caddr_t data, int size)
++{
++	struct pandora_devnode_args *args = (struct pandora_devnode_args *)data;
++
++	if (cmd != PANDORA_DEVNODE_BY_ROLE_CMD || size < (int)sizeof(*args)) {
++		return EINVAL;
++	}
++	if (args->da_op != PANDORA_DEVNODE_OP_GET) {
++		return EINVAL;
++	}
++	if (args->da_role != VFS_PREBOOT_ROLE) {
++		return ENOENT;
++	}
++	bzero(args->da_devnode, sizeof(args->da_devnode));
++	strlcpy(args->da_devnode, "/dev/ufsroot0", sizeof(args->da_devnode));
++	return 0;
++}
++
++static int
++pandora_apfs_mount(__unused struct mount *mp, __unused vnode_t devvp,
++    __unused user_addr_t data, __unused vfs_context_t context)
++{
++	/* libignition treats EBUSY as "preboot is already mounted" and keeps the
++	 * directory it opened; anything else aborts the ignition. */
++	return EBUSY;
++}
++
++static int
++pandora_apfs_init(__unused struct vfsconf *vfsp)
++{
++	return 0;
++}
++
++/* Registered by name in bsd/vfs/vfs_conf.c so that libignition's
++ * fmount("apfs", ...) resolves the filesystem and reaches our mount op. */
++struct vfsops pandora_apfs_vfsops = {
++	.vfs_mount = pandora_apfs_mount,
++	.vfs_init  = pandora_apfs_init,
++};
++
++/* Every path under /private/preboot the boot sequence looks for.  HFS+ takes
++ * one level at a time, and EEXIST is the normal case after the first boot. */
++static const char * const pandora_preboot_dirs[] = {
++	"usr",
++	"usr/standalone",
++	"usr/standalone/firmware",
++	"cryptex1",
++};
++
++static void
++pandora_preboot_tree(void)
++{
++	uint8_t hash[64];
++	size_t hlen = sizeof(hash);
++	char hex[2 * sizeof(hash) + 1];
++	char path[MAXPATHLEN];
++	static const char digits[] = "0123456789ABCDEF";
++	int error;
++
++	if (pandora_preboot_ready) {
++		return;
++	}
++	pandora_preboot_ready = TRUE;
++
++	(void)pandora_mkdir("/private/preboot", 0755);
++
++	if (!IOGetBootManifestHash((char *)hash, &hlen) || hlen == 0 || hlen > sizeof(hash)) {
++		printf("PANDORA PREBOOT: no boot-manifest-hash, no preboot tree\n");
++		return;
++	}
++	for (size_t i = 0; i < hlen; i++) {
++		hex[2 * i] = digits[hash[i] >> 4];
++		hex[2 * i + 1] = digits[hash[i] & 0xf];
++	}
++	hex[2 * hlen] = 0;
++
++	snprintf(path, sizeof(path), "/private/preboot/%s", hex);
++	error = pandora_mkdir(path, 0755);
++	if (error != 0) {
++		printf("PANDORA PREBOOT: %s: error %d\n", path, error);
++		return;
++	}
++	for (size_t i = 0; i < sizeof(pandora_preboot_dirs) / sizeof(pandora_preboot_dirs[0]); i++) {
++		snprintf(path, sizeof(path), "/private/preboot/%s/%s", hex, pandora_preboot_dirs[i]);
++		error = pandora_mkdir(path, 0755);
++		if (error != 0) {
++			printf("PANDORA PREBOOT: %s: error %d\n", path, error);
++		}
++	}
++
++	snprintf(path, sizeof(path), "/private/preboot/%s/.roots-installed", hex);
++	vnode_t vp = NULLVP;
++	error = vnode_open(path, O_CREAT | FWRITE, 0644, 0, &vp, vfs_context_kernel());
++	if (error == 0) {
++		vnode_close(vp, FWRITE, vfs_context_kernel());
++	} else if (error != EEXIST) {
++		printf("PANDORA PREBOOT: %s: error %d\n", path, error);
++	} else {
++		error = 0;
++	}
++	printf("PANDORA PREBOOT: %s/%s: %d\n", "/private/preboot", hex, error);
++}
++
++static int
++pandora_apfs_edt_fstab SYSCTL_HANDLER_ARGS
++{
++	struct pandora_edt_fstab entry;
++
++	/* libignition only ever asks for the preboot role, so one record is the
++	 * whole table.  Creating the tree here is what makes the mount point it
++	 * reads below actually exist. */
++	pandora_preboot_tree();
++
++	bzero(&entry, sizeof(entry));
++	strlcpy(entry.ef_mount_point, "/private/preboot", sizeof(entry.ef_mount_point));
++	entry.ef_role = VFS_PREBOOT_ROLE;
++	return sysctl_io_opaque(req, &entry, sizeof(entry), NULL);
++}
++
++SYSCTL_DECL(_vfs_generic);
++SYSCTL_NODE(_vfs_generic, OID_AUTO, apfs, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
++    "APFS-only interfaces, answered by the pudding shim");
++SYSCTL_PROC(_vfs_generic_apfs, OID_AUTO, edt_fstab,
++    CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0,
++    pandora_apfs_edt_fstab, "-", "volume role to mount point table");
++
++#endif /* PANDORA */
+diff --git a/bsd/vfs/vfs_conf.c b/bsd/vfs/vfs_conf.c
+index bae70cd..2d7616f 100755
+--- a/bsd/vfs/vfs_conf.c
++++ b/bsd/vfs/vfs_conf.c
+@@ -97,6 +97,9 @@ extern  struct vfsops devfs_vfsops;
+ extern  const struct vfsops routefs_vfsops;
+ extern  struct vfsops nullfs_vfsops;
+ extern struct vfsops bindfs_vfsops;
++#if defined(PANDORA)
++extern struct vfsops pandora_apfs_vfsops;
++#endif
+ 
+ #if MOCKFS
+ extern  struct vfsops mockfs_vfsops;
+@@ -110,6 +113,7 @@ enum fs_type_num {
+ 	FT_ROUTEFS = 21,
+ 	FT_NULLFS = 22,
+ 	FT_BINDFS = 23,
++	FT_APFS = 24,
+ 	FT_MOCKFS  = 0x6D6F636B
+ };
+ 
+@@ -194,6 +198,28 @@ static struct vfstable vfstbllist[] = {
+ 	},
+ #endif /* BINDFS */
+ 
++#if defined(PANDORA)
++	/* libignition (in dyld) looks the preboot volume up by role and then
++	 * mounts "apfs" on it.  This entry makes the name resolve so its mount
++	 * op can answer EBUSY -- "preboot already mounted" -- with an HFS+ root;
++	 * bsd/dev/pandora_preboot.c has the details. */
++	{
++		.vfc_vfsops = &pandora_apfs_vfsops,
++		.vfc_name = "apfs",
++		.vfc_typenum = FT_APFS,
++		.vfc_refcount = 0,
++		.vfc_flags = MNT_DONTBROWSE | MNT_RDONLY,
++		.vfc_mountroot = NULL,
++		.vfc_next = NULL,
++		.vfc_reserved1 = 0,
++		.vfc_reserved2 = 0,
++		.vfc_vfsflags = VFC_VFS64BITREADY,
++		.vfc_descptr = NULL,
++		.vfc_descsize = 0,
++		.vfc_sysctl = NULL
++	},
++#endif /* PANDORA */
++
+ #if MOCKFS
+ 	/* If we are configured for it, mockfs should always be the last standard entry (and thus the last FS we attempt mountroot with) */
+ 	{
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index b9870bd..8ee757f 100755
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -12529,6 +12529,10 @@ handle_auth(vnode_t vp, u_long cmd, caddr_t data, u_long options, vfs_context_t
+  * Make a filesystem-specific control call:
+  */
+ /* ARGSUSED */
++#if defined(PANDORA)
++extern int pandora_preboot_fsctl(u_long cmd, caddr_t data, int size);
++#endif
++
+ static int
+ fsctl_internal(proc_t p, vnode_t *arg_vp, u_long cmd, user_addr_t udata, u_long options, vfs_context_t ctx)
+ {
+@@ -12596,6 +12600,14 @@ fsctl_internal(proc_t p, vnode_t *arg_vp, u_long cmd, user_addr_t udata, u_long
+ 
+ 	/* Check to see if it's a generic command */
+ 	switch (cmd) {
++#if defined(PANDORA)
++	case 0xc1044a50ul:
++		/* _IOWR('J', 80, 260): libignition asks which device node backs a
++		 * volume role (op 2, role 16 = VFS_PREBOOT_ROLE).  APFS answers it;
++		 * see bsd/dev/pandora_preboot.c. */
++		error = pandora_preboot_fsctl(cmd, data, (int)size);
++		break;
++#endif
+ 	case FSIOC_SYNC_VOLUME:
+ 		error = handle_sync_volume(vp, arg_vp, data, ctx);
+ 		break;
