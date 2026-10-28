@@ -276,3 +276,17 @@ IOService**，于是 loader abort，随后内核 panic（panic 文本没进日�
   mount-phase-2 → init-with-data-volume → MSUEarlyBootTask → fips → keybag →
   usermanagerd → launchd_cache_loader`；之后才是 532 个 LaunchDaemons 的
   daemon 阶段。
+
+- 18:35 试了「本地重链内核」这条路（绕开 macOS runner）：
+  - 用 `xnu-objects` artifact 里的 1129 个对象 + `link.filelist` 的顺序 +
+    `libfirehose_kernel.a` / `libclang_rt.cc_kext.a`，可以喂给 LLVM 的
+    `ld64.lld`；它不认 `-alias_list`，但把 `all-alias.exp` 生成一份
+    `符号 = 变体符号` 的汇编（`patchwork/mk_alias_asm.py`）就能补上；
+    `-platform_version macos 13.5 14.0` 必须显式给。
+  - 这样链接到只剩我们自己的两个符号（说明链路是可行的），但**卡在编译
+    IOKit 的 C++**：`OSDefineMetaClassAndStructors` 依赖 Apple clang 的
+    kalloc_type 插件，Ubuntu 的 clang 18 会在该宏上直接报
+    "does not refer to a value"（对仓库里原本就能编过的 `SweetKeyStore.cpp`
+    也一样）——所以本地能编 C、编不了这个 C++ 服务。
+  - 结论：纯 C 的补丁可以在本地重链验证；但 `0244`（AMFI 服务）这种 C++ 的
+    仍然必须走 CI。相关脚本：`tools/relink_local.py`。
