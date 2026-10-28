@@ -878,3 +878,27 @@ Setup 停在 hello 很可能是因为**设备没被"激活"**。之前 mad 一�
 mad 的代理/网络路径可能就能过。run9 = run8 + 真 mad（`PD_KEEP_MAD=1`）。
 
 如果 run9 的 Setup 直接跳过、进到锁屏，那"从 logo 到锁屏"这条主线就通了。
+
+### 06:45 run9：真 mobileactivationd 放回去反而把系统拖死了
+
+run9 = run8 + 真 mad（`PD_KEEP_MAD=1`，固件包已换成 keybag-only 不再覆盖 plist）。
+结果：mad 从 13.4 s 起持续崩（`sig 5`，同一 pc），**屏幕只 present 了 6 帧（54 s 就停了）**，
+Setup 都没出来。
+
+原因很直接：mad 这次是**注册了 MachServices 的**，客户端（lsd、SpringBoard）会连上它、它又崩，
+比"服务不存在"更容易把别人拖住。
+
+所以回到 run8 的配置：**CommCenter 保留、mad 继续桩掉**。这已经是今晚最好的状态
+（Setup 的 hello 界面能正常渲染）。当前 `ios-root.img` 和手机上的 pinned 镜像都是这个状态。
+
+### 明早的下一步（按顺序）
+
+1. **弄清 SetupDone 为什么没生效**：拉 run8 那轮的镜像（`pinfile rawread` → guestfish），看
+   `/private/var/mobile/Library/Preferences/com.apple.purplebuddy.plist` 在数据迁移之后还是不是
+   我们写的 `SetupDone=1`。如果被迁移重置了，就要么在迁移之后再写（内核 pack 的时机要往后挪），
+   要么改由 launchd 的 job 来写。
+2. **跳过 Setup 的替代路径**：用 `pandora_selftest` 注入上滑/点击走完 Setup 的前几屏
+   （现在 UI 和输入链路都通了，值得试）；Setup 里没有网络可以选"稍后设置"。
+3. **激活**：mad 的断言在 `copyReverseProxyDictionary`，可以给镜像补
+   `/private/var/preferences/SystemConfiguration/preferences.plist`（ios-sweet v14/v15 就是这么干的），
+   看看代理字典能不能不再是 NULL。
