@@ -489,3 +489,75 @@ flush 文件与 HFS 日志。两者都是内核侧改动，属于下一轮的工
 
 所以要让"替换系统文件"生效，只能走**持久化**（让文件在下次启动前就在盘上）——
 这需要 HFS 日志提交真正落盘（目前每次启动仍报 `1 written`，说明没持久化）。
+
+## 2026-10-29 凌晨 —— 卡点是窗口太短，不是卡死
+
+### 实测：iOS 侧的启动要 ~14 分钟
+
+同一个 `0249` 内核，只改 `pandora_reboot_after` 与 `pandora_fbdump`，三次启动的进度条
+填充比例（`fbdump.py` 出的 surface PNG 逐像素测的，轨道 73..302，白色为已填充）：
+
+| 那一帧的 uptime | 进度条 | 当时在干什么 |
+|---|---|---|
+| 59 s | 0% | 第一帧，logo + 空轨道 |
+| 365 s | 49% | 什么都没有，只有 bluetoothd/fairplayd 每 10 s 重生 |
+| 815 s | 83% | 同上 |
+| **~828 s** | — | **一批服务突然启动**：`installd`、`appstored`、`assetsd`、`itunesstored`、`migrationpluginwrapper`、`coresymbolicationd`… ≈ 89 次 exec / 1 秒 |
+
+也就是说，180 s 和 420 s 的自动重启都在"启动完成"之前把机器重置了。**之前的"卡在 logo"
+是窗口太短造成的观测假象。** 之后一律用 `pandora_reboot_after=1500` 起步，帧转储放在
+900 s 之后。
+
+同一轮里 `homed`（898 s）和 `SiriTTSSynthesizerAU`（894 s）各崩了一次
+（`sig 6` = SIGABRT，`Too many corpses being created`）；`com.apple.migrationpluginwrapper`
+在一次启动里跑了三次（43 s、828 s、887 s），和上游"数据迁移每次开机重跑"的记载一致。
+
+### 新工具
+
+- `tools/run_boot.sh IMG NAME SECS`：一整轮无人值守 —— `adb reboot bootloader` →
+  `fastboot boot` → 等自动重启回安卓 → `pinfile rawread` 拉 pinned 日志（前 184 字节是
+  pinfile 自己打印的 extent 检查，按 `PANDORLG` magic 切掉）→ `pandora_log.py` 解码 →
+  `fbdump.py` 出 surface/panel PNG。
+- `tools/thumbs.py LOG OUTDIR`：把内核日志里的 ASCII 缩略图渲染成 PNG。
+- `tools/restore_root.sh [IMG]`：把本地 16 GiB 根镜像写回 pinned 文件（先校验 extents
+  与 ADT 记录一致）。
+
+### 0250：屏幕缩略图时间线（无人值守的关键）
+
+`bsd/dev/pandora_selftest.c` 里加了第二个线程：`pandora_thumbs_start` /
+`pandora_thumbs_every` / `pandora_thumbs_until`，每 N 秒调用已有的 `sweet_fb_thumb()`
+把 1125×2436 的屏幕采样成 60×130 的十六进制 ASCII（每个像素一个亮度 nibble）写进内核日志，
+tag 是 uptime 秒数。这样一轮 25–40 分钟的启动，日志里就有整条画面时间线，
+不用再赌 `pandora_fbdump` 恰好落在哪一秒。日志体积：每帧 ~130 行 × 60 字符 ≈ 8 KB，
+60 s 一帧、25 分钟约 200 KB，4 MiB 环完全够。
+
+### 新问题：HFS 在盘上的损坏会累积
+
+日志里的 `hfs: BlockMarkFreeInternal() trying to free unallocated blocks` +
+`hfs_mark_inconsistent: Runtime corruption detected on iOSRoot, fsck will be forced on next
+mount`，按启动次序统计：
+
+| 那一轮 | 内核 | `Runtime corruption` | `CRASH` |
+|---|---|---|---|
+| `ioslog-tweak2`（180 s） | 0249 | 0 | 0 |
+| `ioslog-r420` | 0249 | 1 | 0 |
+| `ioslog-r900` | 0249 | 5 | 196 |
+| `ioslog-r1000` | 0249 | 327 | 412 |
+
+`r1000` 那一轮已经起不来了：`containermanager` 从 12.7 s 起 `sig 5 code 0x600000001`
+反复崩，**屏幕一次都没亮**（整个日志只有 3 行 `SWEET FB`，没有 `display on`）。
+即 `/private/var` 的写入每开机一次就往盘上留一点不一致，几轮之后系统就起不来 ——
+这和"写入不持久"是同一族问题（HFS 位图/日志提交路径），只是方向相反：改动有一部分
+落到了盘上，但没走日志，留下不一致。
+
+处理：**每次长跑前用 `tools/restore_root.sh` 把本地干净镜像写回**（16 GiB，push + rawwrite
+约 10–15 分钟）。要根治得修 HFS 写入路径，或者让根卷以只读挂载跑（iOS 会抱怨写失败，
+但可能仍能到锁屏）——留给后续验证。
+
+### 下一步（无人值守的迭代计划）
+
+1. 恢复干净镜像 → 用 `0250` 内核 + `pandora_reboot_after=1500` + 每 60 s 缩略图跑一轮，
+   确认 828 s 之后屏幕到底变成什么（锁屏？还是继续 logo）；
+2. 若到锁屏：用 `pandora_selftest` 注入上滑手势解锁（`st_swipe` 起点 562,2425 → 562,1100），
+   再往桌面推；
+3. 若不到：按缩略图时间线定位卡在哪个阶段，再决定改内核还是改镜像。
