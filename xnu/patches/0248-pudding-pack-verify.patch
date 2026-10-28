@@ -1,0 +1,54 @@
+diff --git a/bsd/dev/pandora_files.c b/bsd/dev/pandora_files.c
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -122,8 +122,38 @@
+ 	}
+ 	return error;
+ }
+ 
++
++/* 0248: after a write, read the file back through a fresh vnode and report
++ * the mount point it lives on.  A write that reports success but leaves the
++ * old bytes behind means the VFS layer is not applying it; new bytes that
++ * launchd ignores mean launchd reads them from somewhere else. */
++static void
++pf_verify(const char *path, vfs_context_t ctx, const uint8_t *want, uint64_t size)
++{
++	vnode_t vp = NULLVP;
++	uint8_t got[16];
++	size_t have = (size_t)MIN((uint64_t)sizeof(got), size);
++	int error = vnode_open(path, FREAD, 0, 0, &vp, ctx);
++	if (error) {
++		printf("PANDORA FILES: verify %s: open error %d\n", path, error);
++		return;
++	}
++	struct vfsstatfs *sb = vfs_statfs(vnode_mount(vp));
++	int resid = 0;
++	if (!vn_rdwr(UIO_READ, vp, (caddr_t)got, (int)have, 0, UIO_SYSSPACE, 0,
++	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx)) && resid == 0) {
++		printf("PANDORA FILES: verify %s: mount %s type %s n=%d read %02x%02x%02x%02x want %02x%02x%02x%02x\n", path,
++		    sb ? sb->f_mntonname : "?", sb ? sb->f_fstypename : "?", (int)(have - resid),
++		    got[0], got[1], got[2], got[3],
++		    want ? want[0] : 0, want ? want[1] : 0, want ? want[2] : 0, want ? want[3] : 0);
++	} else {
++		printf("PANDORA FILES: verify %s: read failed\n", path);
++	}
++	vnode_close(vp, 0, ctx);
++}
++
+ static void
+ pf_thread(void *arg, wait_result_t result)
+ {
+ 	(void)arg;
+@@ -208,8 +238,11 @@
+ 			same++;
+ 		} else if (!(error = pf_write(path, e, a, mode ? mode : 0644, ctx))) {
+ 			written++;
+ 			printf("PANDORA FILES: %s -> %s (%llu bytes)\n", name, path, e->size);
++			if (!pandora_fw_read(e->off, a, (uint64_t)MIN((uint64_t)PF_CHUNK, e->size))) {
++				pf_verify(path, ctx, a, e->size);
++			}
+ 		}
+ 		if (error) {
+ 			failed++;
+ 			printf("PANDORA FILES: %s -> %s: error %d\n", name, path, error);
