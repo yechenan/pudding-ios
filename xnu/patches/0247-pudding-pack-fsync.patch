@@ -1,0 +1,39 @@
+diff --git a/bsd/dev/pandora_files.c b/bsd/dev/pandora_files.c
+--- a/bsd/dev/pandora_files.c
++++ b/bsd/dev/pandora_files.c
+@@ -105,10 +105,23 @@
+ 		if (!error && resid) {
+ 			error = EIO;
+ 		}
+ 	}
++	/* 0247: vn_rdwr only dirties the vnode; without an explicit fsync the HFS
++	 * journal keeps the old contents, so a later reader (launchd reading the
++	 * daemon plists, or this code on the next boot) still sees the previous
++	 * file even though the write reported success. */
++	if (!error) {
++		error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++	}
+ 	int cerr = vnode_close(vp, FWRITE, ctx);
+-	return error ? error : cerr;
++	if (!error) {
++		error = cerr;
++	}
++	if (!error && rootvnode != NULLVP) {
++		error = VNOP_FSYNC(rootvnode, MNT_WAIT, ctx);
++	}
++	return error;
+ }
+ 
+ static void
+ pf_thread(void *arg, wait_result_t result)
+@@ -119,9 +132,9 @@
+ 	/* The root file system: wait for it to be mounted. */
+ 	for (int i = 0; i < 600 && rootvnode == NULLVP; i++) {
+ 		pf_sleep(500);
+ 	}
+-	pf_sleep(2000);
++	pf_sleep(200);   /* 0247: get in before launchd scans LaunchDaemons */
+ 	uint8_t blk[4096];
+ 	uint32_t n = 0;
+ 	if (rootvnode == NULLVP || pandora_fw_read(0, blk, sizeof(blk))) {
+ 		printf("PANDORA FILES: no root or no pack\n");
