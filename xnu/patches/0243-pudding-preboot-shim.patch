@@ -93,7 +93,7 @@ new file mode 100644
 index 0000000..0000000
 --- /dev/null
 +++ b/bsd/dev/pandora_preboot.c
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,237 @@
 +/*
 + * PANDORA preboot shim (patch 0243): make iOS 16 libignition's "preboot"
 + * stage succeed on an HFS+ root.
@@ -257,8 +257,7 @@ index 0000000..0000000
 +	/* Publish AppleMobileFileIntegrity early: launchd_cache_loader matches it
 +	 * by class name at ~12 s and aborted (then the kernel panicked) without it. */
 +	if (sweet_amfi_publish() != 0) {
-+		printf("PANDORA PREBOOT: no AMFI service
-+");
++		printf("PANDORA PREBOOT: no AMFI service\n");
 +	}
 +
 +	/* keybagd (MKB) opens the system keybag on the data volume and reboots
