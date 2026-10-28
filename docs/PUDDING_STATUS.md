@@ -420,3 +420,24 @@ pinned 文件扩大。
 flush 文件与 HFS 日志。两者都是内核侧改动，属于下一轮的工作。
 
 固件包已恢复成只有 keybag（`pack/iosfw.img` 原样写回 pinned 文件）。
+
+### 21:15 0247（pack fsync + 提前安装）实测：没解决问题
+
+- 内核侧改动本身编译通过、构建成功（run `40687474555`，macos-15，6 分钟就出包）；
+- 真机启动：安装日志依旧在 `2.686 s`，`mobileactivationd` 依旧 **17 次 exec /
+  68 次崩溃**，与替换前完全一致 —— 说明 launchd 仍然读到了旧 plist；
+- 启动日志里只有挂载时的 `jnl: replay_journal ... done`（0.18–0.30 s），没有报错。
+
+**结论**：`pf_write` 的写入既没在本次启动里被 launchd 看到，也没持久化（下次启动仍报
+`1 written`）。要么 HFS 写入路径没有真正落到数据块/编目，要么 launchd 读的不是这个
+文件。下一步应该先做一个最小判定实验（**不再改代码**）：同样的包连续启动两次，看第二次
+是否变成 `0 written`：
+- 变成 `0 written` → 写入持久了，问题在 launchd 的读取路径/缓存；
+- 仍是 `1 written` → 写入根本没落盘，要修 `sweet_hfs` 的写入/日志提交。
+
+### 今晚的最终状态（21:20）
+
+- 内核启动链：**preboot → keybag → AMFI → SpringBoard/backboardd 全通**，
+  497 次 exec、120 fps 帧缓冲、无 panic；
+- 唯一用户态卡点：`mobileactivationd` 的 ObjC 断言（激活服务）；
+- 所有改动已推送（最新 `ecb1ff11` 含 0247），文档即本文件。
