@@ -327,3 +327,17 @@ IOService**，于是 loader abort，随后内核 panic（panic 文本没进日�
 sig 5 code 0x600000001 ... reason ns 2 code 0x5`），12 次后 launchd 报
 "Too many corpses being created"。pc 每次都落在同一个偏移，是确定性断言而不是偶发。
 下一步就是处理激活状态（或者让 mobileactivationd 认为设备已激活）。
+
+### mobileactivationd 的 SIGTRAP（20:10 反汇编）
+
+- 三次崩溃的 `pc` 相对 Mach-O 头的偏移完全一致：`mh + 0x1BF3BC`，
+  而 `0x1BF3BC` 正是 `__text` 的末尾、紧挨 `__stubs`（`__stubs` 从 `0x1001BF778`
+  开始）。那条指令是 `brk #0x1`，前面一串 `bl` 是这个二进制里共享的
+  "trap 助手"（Swift `fatalError`/断言共用的收尾）。
+- 所以真正的位置要看调用者：backtrace 给的返回地址 `mh + 0x50B674`。
+  行为是**确定性断言**，不是随机内存问题。
+- 同日整机状态：`exec` 497 次，`SpringBoard`、`backboardd`、`amfid`、`accountsd`、
+  `CommCenter`、`homed` 等都在跑；帧缓冲持续在动画
+  （`600 frames / 5000 ms ≈ 120 fps`、`14000 swaps`）；没有 `Setup`/`Buddy`。
+- 结论：内核侧的启动链已经能一路走到用户态图形栈，剩下的问题是
+  **激活状态/激活服务这层用户态逻辑**（以及后续的 setup 流程）。
