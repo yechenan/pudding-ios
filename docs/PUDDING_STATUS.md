@@ -246,3 +246,20 @@ IOService**，于是 loader abort，随后内核 panic（panic 文本没进日�
 - 本地能做的验证都做了：`pandora_preboot.c`（CI 编译命令，0 error）、
   `SweetAMFI.cpp`（同一套 include/flags，0 error）、两个补丁 `git apply --check` 通过。
   上一轮的失败里有一个是真正的代码 bug（`printf` 字符串被写成跨行），已修。
+
+### 2026-10-28 18:00 无人值守：补丁 0245 / 0246
+
+- **0245**：`sweet_amfi.c` 里两个 CoreEntitlements 桩函数原来是 `panic()`，
+  改成返回 `kCEQueryCannotBeSatisfied` / `NULL`。`launchd_cache_loader` abort 时
+  会查自身 entitlements，一旦走到这里就把整机带走（日志里那次 `restart type 4`
+  没有任何 panic 文本，很可能就是这种"无声 panic"）。
+- **0246**：给 `IORPC` 增加尾部成员 `kernelContent`。macOS 15 的镜像只有
+  Xcode 16/26，它们的 `iig` 生成的代码无条件读写 `rpc.kernelContent`，而
+  xnu-8796 没有这个成员 —— 这就是 macos-15 上 34 个 `*.iig.cpp` 全灭的原因。
+  前四个字段的位置不变，`IOUserServer.cpp` 里唯一的指定初始化会把新成员置零。
+- `xnu.yml`：没有 Xcode 15 时优先选 **Xcode 16.x**（而不是 26.x），配合 0246
+  就可以在 macos-15 池上构建，避开 macos-14 的排队。
+- 本地验证：`sweet_amfi.c`、`IOUserServer.cpp` 用 CI 编译命令各跑一遍都是
+  **0 error**；三个补丁 `git apply --check` 通过。
+- 当晚 17:40–18:00 期间 **所有 macOS 池（13/14/15）都排不上机器**，连几十秒的
+  `ping` 也被排到 15 分钟上限后取消，只能高频重派抢票。
