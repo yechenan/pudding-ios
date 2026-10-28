@@ -25,3 +25,44 @@
 - 内核必须在 macOS 上编（CI 排队时间不可控，高峰可达 1 小时以上）；
 - `cpus=1` 会触发 `ml_get_max_cpu_number` 断言，启动一律用 `cpus=8 bootcpu=7`；
 - 日志文件（补丁 0129）必须 `ufsrw=1` 才会 flush。
+
+## 2026-10-28 进展：iOS 用户态已执行
+
+启动参数（关键）：
+
+```
+debug=0x0 serial=3 cpus=8 bootcpu=7 keepsyms=1 -v rd=ufsroot0 ufsrw=1 rootrw=1
+pandora_touch=0 pandora_keys=0 pandora_reboot_after=180
+unentitled_ios_sim_launch=1 cs_enforcement_disable=1
+```
+
+| 里程碑 | 证据 |
+|---|---|
+| launchd 不再被签名杀掉 | `unentitled_ios_sim_launch=1`（绕过 macOS 目标内核上的 no-sandbox 检查） |
+| dyld 共享缓存找到并映射 | 补丁 0241 之外，靠 `cs_enforcement_disable=1` 跳过 uid=0 / trust cache 检查 |
+| 共享缓存全量加载 | `PANDORA CS4K: dyld_shared_cache_arm64.01 … .42`，4 GB，12 秒 |
+| launchd 执行 | `exec launchd`、`libignition: hello from launchd.1` |
+
+### 当前卡点：preboot 卷
+
+```
+libignition: preboot: mounting preboot
+libignition: failed to lookup preboot: 25
+ERROR: BindFS bindfs_mount: lookup of /private/preboot/5CBE36…/usr/standalone/firmware failed error: 2
+com.apple.xpc.launchd <Notice>: No cookie: /private/preboot/5CBE36…/.roots-installed
+→ MACH Reboot
+```
+
+libignition 查 preboot 走 **IOKit 的 `IOGetApfsPrebootUUID`**（不是 `kern.apfsprebootuuid` 这个 sysctl——补丁 0242 改的是 sysctl，因此没解决它）。
+
+### 下一步（一次做完）
+
+1. 把 preboot UUID 固定为常量 `00000000-0000-0000-0000-000000000001`；
+2. 内核：让 `IOGetApfsPrebootUUID` 返回该常量（iokit/Kernel）；
+3. 镜像：建 `/private/preboot/<该 UUID>/usr/standalone/firmware` 与 `.roots-installed`；
+4. 一次构建 → 一次写盘 → 启动。
+
+### 镜像构建的两个关键修复（已生效）
+
+- dyld 缓存必须链到 `/System/Library/Caches/com.apple.dyld/`，文件是 `dyld_shared_cache_arm64`（**不是 arm64e**），且要用 **iOS 的**那份，不能用 `System/DriverKit/...`；
+- 缓存文件的 uid 必须是 0（macOS 建镜像要 `hdiutil attach -owners on`），否则 `shared_region_map` 报 `owned by uid=501`。
