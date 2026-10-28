@@ -398,3 +398,25 @@ pinned 文件扩大。
 2. 给模拟的网络（`SWEET NET`）补一个可用的接口/DHCP，排除"没有网络导致
    activation 断言"；
 3. 最后才是预置激活记录。
+
+### 20:40 用固件包替换 mobileactivationd 的 plist：实验与两个结论
+
+把 `mad_stub.plist`（`ProgramArguments = /usr/bin/true`，去掉 MachServices/LaunchEvents）
+打进固件包，`files.txt` 指向
+`/System/Library/LaunchDaemons/com.apple.mobileactivationd.plist`，原地重写 pinned 文件后
+启动两次，结果：
+
+- 安装本身成功：`PANDORA FILES: mad_stub.plist -> /System/Library/LaunchDaemons/... (221 bytes)`；
+- **但 launchd 仍然启动了真正的 mobileactivationd**（17 次 exec / 68 次崩溃，和替换前完全一样）。
+
+两个原因：
+
+1. **时机太晚**：`pandora_files` 在根卷挂载后 2 s 才写文件（日志里是 2.69 s），而 launchd 在
+   1 s 出头就把 `/System/Library/LaunchDaemons` 扫进缓存了；
+2. **不持久**：下一次启动时同一行仍然是 `1 written`（`pf_same()` 判定内容不同），
+   说明写入没有落进 HFS 日志/磁盘，重启即丢。
+
+要真正替换系统 daemon，需要：(a) 把安装提前到 launchd 扫描之前，(b) 写完后
+flush 文件与 HFS 日志。两者都是内核侧改动，属于下一轮的工作。
+
+固件包已恢复成只有 keybag（`pack/iosfw.img` 原样写回 pinned 文件）。
