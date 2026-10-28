@@ -67,8 +67,10 @@ printf '%s
 # The iPhone X userland is plain arm64 (A11 has no arm64e): the cache is
 # dyld_shared_cache_arm64 plus split subcaches (.01 … .NN). dyld opens the main
 # file by name and then its siblings, so link the whole set.
-cache_dir=$(sudo find "$mnt/dst/private/preboot/Cryptexes" -name 'dyld_shared_cache_arm64' -print -quit 2>/dev/null || true)
-cache_dir=${cache_dir%/*}
+# Take the iOS cache, not the DriverKit one: the cryptex also ships
+# System/DriverKit/System/Library/dyld/dyld_shared_cache_arm64, and dyld rejects
+# a cache "for a different platform".
+cache_dir="$mnt/dst/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld"
 if [ -n "$cache_dir" ] && [ -d "$cache_dir" ]; then
 	sudo mkdir -p "$mnt/dst/System/Library/Caches/com.apple.dyld"
 	for f in "$cache_dir"/dyld_shared_cache_arm64*; do
