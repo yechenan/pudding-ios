@@ -290,3 +290,18 @@ IOService**，于是 loader abort，随后内核 panic（panic 文本没进日�
     也一样）——所以本地能编 C、编不了这个 C++ 服务。
   - 结论：纯 C 的补丁可以在本地重链验证；但 `0244`（AMFI 服务）这种 C++ 的
     仍然必须走 CI。相关脚本：`tools/relink_local.py`。
+
+### 2026-10-28 19:25 CI 失败的根因：0245 引用了内核没链接的符号
+
+上一轮 macos-15 构建"编译全过、最后失败"。把失败 run 的 `xnu-objects` 拉下来和
+`link.filelist` 逐条比对：**1129 个目标文件一个不缺**，说明死在链接。
+`0245` 里的 `return kCEQueryCannotBeSatisfied;` 引用了 `CoreEntitlements` 的符号，
+而内核根本没有链接这个库 —— 全仓库只有 `sweet_amfi.o` 在 `U` 引用它。已删除 0245。
+
+顺带确认：那一轮在 **Xcode 16.4** 下把 1129 个对象全编出来了，说明 `0246`
+（`IORPC.kernelContent`）**确实修好了 Xcode 16 的 iig 兼容**，macos-15 池可用。
+
+**本地重链的边界**：用 CI 的 objects + `link.filelist` + 伪 alias + 给 CE 补空符号，
+可以链接成功（20.9 MB），但 LLVM 18 的 `ld64.lld` 明确没有实现
+`-image_base` / `-segaddr`，所有段落落在 `0x0`，而内核必须链在
+`0xfffffff007004000` —— 产物不可启动，这条路只适合验证"能不能过编译/链接"。
