@@ -620,3 +620,39 @@ SpringBoard 不再有任何动作。
 
 镜像写好后用 `tools/restore_root.sh` 把它 rawwrite 回手机（extents 不变，ADT 不用重建），
 再跑一轮 1500 s 的启动。
+
+## 2026-10-29 02:30 移植 root tweaks 之后：SpringBoard 真的起来了
+
+同一套内核（`0250`）、同一份 1500 s 窗口，只把镜像换成打完 root tweaks 的版本：
+
+| | run1（tweaks 之前） | run2（tweaks 之后） |
+|---|---|---|
+| SpringBoard 的 `|SpringBoard|` 日志 | **0 行** | **410 行**，其中 `SBCoverSheetPrimarySlidingViewController`（锁屏）在 835 s 被创建 |
+| SpringBoard 创建 surface | 无 | `id 43 1125x2436`、`id 44 94x203`（835 s） |
+| 屏幕 | 苹果 logo + 进度条一路爬 | 苹果 logo（**进度条消失**，说明启动进度走完了） |
+| 提交到屏幕上 | 120 fps 连续 | **总共只有 7 次**（6 次在 53 s，第 7 次在 836 s） |
+
+也就是说：**启动流程走完了、锁屏的控制器建出来了，但 SpringBoard 的内容没有被送进合成器**。
+836 s 之后再没有 `SWEET FB: swap`，屏幕冻结在第 7 帧（logo）。
+
+这一轮里唯一反复崩的东西是**壁纸**：
+
+```
+[854.296] exec AegirPoster
+[854.296] CRASH AegirPoster[465] sig 6 code 0x0 ... pc 0x1e9ac3198   （同一 pc，88 次）
+[854.383] SWEET SURF: CollectionsPoster create id 57 1271x1823 ...
+[856.809] SWEET SURF: b3a8 1125x2436 plane 0 ... plane 1 ...        （10-bit 双平面 surface）
+```
+
+崩溃统计：`SiriTTSSynthesizerAU` 96、`MacinTalkUSP` 96、`KonaSynthesizer` 96（都是语音合成，
+没有对应硬件）、`AegirPoster` 88、`homed` 40、`assetsd` 16。
+
+下一步两个候选（都在 900 s 之后动手，不影响启动）：
+1. 用内核的按键注入在 900 s 按一次电源键（`pandora_selftest=900`），看能不能把"画好了但没送上屏"
+   的画面逼出来 —— 这一轮正在跑；
+2. 若还是不动，就针对壁纸：`AegirPoster` 每次都在同一 pc 断言，且它要的是 10-bit 双平面
+   surface，很可能是没有 Metal/GPU 导致；可以试着把 `PosterBoard`/海报扩展的 job 关掉，
+   让锁屏退回纯色背景。
+
+顺带：这一轮 `Runtime corruption` 是 **0 条**（run1 也是 0，run0 是 327）——
+把 `/private/var/containers` 建出来之后，HFS 的 orphan 清理不再乱释放块了，卷的损坏问题自己消失了。
