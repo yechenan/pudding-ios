@@ -9,13 +9,17 @@
 ## 一分钟现状
 
 - 手机：小米 17（pudding / SM8850），iOS 16.7.16（20H392，iPhone X 的 iPSW）。
-- 已经做到：**内核能启动、iOS 用户态能跑、界面能渲染（SpringBoard 出画面）、能用内核注入点击操作**、
-  **不接电脑也能在开机时选 iOS/安卓（boot_a 里的开机菜单，按音量上）**。
-- 还卡在：**Setup（设置向导）过不去 → 进不了锁屏/桌面**。另外根卷是"非日志式"，硬复位后变脏，
-  脏挂载会让 HFS 在运行期反复判损坏（见 MISTAKES #6/#25）。
-- 上游同机型仓库已经到桌面：`ShueiTsuki/data-a-live`（作者机器上锁屏/桌面/GPU/触摸/音量都能用），
-  镜像侧脚本在 `bangprovn/ios-fuxi`。
-
+- **已打通：内核 → 用户态 → SpringBoard → 锁屏 → 桌面**（2026-10-29 21:40，Setup 已被跳过）。
+- 跳过 Setup 的关键**不是偏好**，而是把 SpringBoard 的 `-[SBSetupManager updateInSetupMode]`
+  在 dyld 缓存里打成 `ret`（要连 CodeDirectory 的页哈希一起改，否则 4K 校验会拒绝）。
+  细节和字节都在 `PUDDING_STATUS.md` 的 2026-10-29 21:40 那一节。
+- 桌面侧已可用：触摸（`pandora_touch=15`）、电源/音量键（`pandora_keys=3`）、
+  画面铺满（`sweetfb_fill=1`）、CPU 合成显示。
+- 还没做：Wi-Fi（无 WCN 驱动）、音频输出、GPU 合成、USB 数据。
+- 根卷仍是"非日志式"：硬复位后要先 `tools/clear_dirty_bit.sh`（2 秒），
+  卷真的损坏时必须 `restore_root.sh`（12 分钟，且下次启动要重建 LaunchServices 表 ~835 秒）。
+- 上游同机型仓库：`ShueiTsuki/data-a-live`（他们更领先：GPU/音频/触摸全通），
+  镜像侧脚本 `bangprovn/ios-fuxi`。
 
 ## 仓库和文件都在哪
 
