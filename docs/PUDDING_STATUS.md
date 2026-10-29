@@ -1057,3 +1057,19 @@ Back 能退回到 Wi-Fi 屏。也就是说这是 **"Connect to Mac or PC" 的等
 - 内核 `relink/kernel-0260`（thumbs + ps + cat + kill + gesture + 定时 dump 的失败版）；
 - 一轮迭代现在 **3–6 分钟**（不恢复镜像），需要干净基线时才 `restore_root.sh`（约 5 分钟 + 首次开机 14 分钟）；
 - 所有结论在上面 + `git log`（仓库 `yechenan/pudding-ios`，最新 `5fac5a0`）。
+
+### 12:00 最后一次尝试：手工预置 activation data ark —— 没成功
+
+从热镜像里发现系统已经自己建了 12 个系统容器（`com.apple.springboard`、`lsd`、`backboardd`、
+`fairplayd.H2`…），metadata plist 结构很简单。于是照着建了一个
+`com.apple.mobileactivationd` 容器 + `Library/internal/data_ark.plist`（`-ActivationState=Activated`
+等 6 个键），并把 job 表换回真 mad，写回手机跑了一轮（run36）：
+
+- mad 仍然在 12.8 s 崩（37 次，同一断言），**data ark 没能改变它的启动路径**；
+- 这轮镜像还因为改了 HFS 卷属性 + 脏卷写回，`hfs_mark_inconsistent` 飙到 4247 条，UI 没起来。
+
+已经把手机上的镜像恢复成干净的 tweaked 版本（`tools/restore_root.sh`，HFSX 校验通过）。
+
+结论：**激活这条线要动的是 mad 的崩溃本身，不是它的数据**。下一步应该在用户态层面查
+`copyReverseProxyDictionary` 的断言（比如用 `pandora_cat` 读它崩溃前的日志、或按 myron 的
+AEGIRPOSTER 思路做一个注入 dylib 的钩子），而不是继续喂数据。
