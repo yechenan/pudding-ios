@@ -12,7 +12,7 @@ kernel=$(realpath "$1")
 adt=$(realpath "$2")
 mkdir -p "$3"
 out=$(realpath "$3")
-cmdline=${4:-"debug=0x0 serial=3 cpus=8 bootcpu=7 keepsyms=1 -v rd=ufsroot0 ufsrw=1 rootrw=1 pandora_touch=0 pandora_keys=0 pandora_reboot_after=120"}
+cmdline=${4:-"debug=0x0 serial=3 cpus=8 bootcpu=7 keepsyms=1 -v rd=ufsroot0 ufsrw=1 rootrw=1 pandora_touch=0 pandora_keys=0"}
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 
