@@ -5,6 +5,7 @@
 
 | # | 错误 | 后果（证据） | 以后的规矩 |
 |---|------|--------------|-----------|
+| 29 | 在用户还在摆弄手机时后台启动 12 分钟的 `restore_root.sh`（17 GB 写盘） | adb 中途掉线，`rawwrite` 只写了一半 → pinned 镜像状态未知（可能需要整份重写） | 长时间写盘/刷机前**先确认**“线插着、别动、别拔”，并在开头就说明要多久；恢复后必须跑 HFSX + 状态校验 |
 | 28 | 以为"设备不在 adb/fastboot"就是卡死 | 用户只是拔了线，我一度准备按"菜单卡死"排查 | 没设备时先问一句/先等 30 秒，别直接判定故障 |
 | 27 | 恢复镜像后没意识到 pinned extents 会变 | 差点用旧 extents 的槽位启动 iOS（会读写到别的块，写坏安卓数据） | 任何镜像改动之后**必须**重跑 `tools/bootmenu_slot.sh --yes` |
 | 26 | 槽位里 logo 用了相对路径 | `mk_boot_local.sh` 先 `cd data-a-live/shim/loader`，相对的 `LOGO` 找不到 → 槽位 logo 0 字节，白写一次 | 跨目录前把路径 `realpath` 成绝对；`prepare_run.sh` 与 `mk_boot_local.sh` 都已补 |
