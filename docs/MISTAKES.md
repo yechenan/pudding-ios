@@ -5,6 +5,10 @@
 
 | # | 错误 | 后果（证据） | 以后的规矩 |
 |---|------|--------------|-----------|
+| 47 | 拿 `/root/rl` 的 CI 对象当基座、再叠上自己从当前源码树编的对象去重链内核 | 三个内核全部早期 panic（0.12–0.46 s），最后一个连一个对象都没换也 panic 在 `@IOPlatform.cpp:289`；而 `IOPlatform.cpp` 在我们源码树里根本不存在 → 对象集来自更新的源码 | **对象集、link.filelist、源码树必须同源**；`ci4/.../xnu.obj`（1129 条）与 `/root/rl`（1130 条）不是同一代，不能混用 |
+| 48 | 用 `ld64.lld` 链内核 | 产物是 `LC_MAIN`，`tools/mkpayload.py` 只认 `LC_UNIXTHREAD`，报 `required argument is not an integer` | 链内核用 `/opt/ld64/bin/aarch64-apple-darwin-ld`，strip 用同目录的 `aarch64-apple-darwin-strip` |
+| 49 | 以为本地编不了 C++ 内核代码 | 实际只是缺 Apple clang 的三个 builtin；stub 掉之后 `PandoraAudio.cpp`/`SweetAMFI.cpp` 都能编 | 先试 `work-audio/stubs.h` 那套，再谈只能走 CI |
+| 50 | 把 17 GB 的镜像/内核任务和"等 adb"的轮询放在同一个前台命令里 | 一次 `adb reboot bootloader` 之后 prepare_run 因"no devices"失败，手机在 fastboot 里挂了 5 分钟 | 刷机/重启类命令之后，先单独确认 `adb devices` 或 `fastboot devices` 的状态再继续 |
 | 40 | 用 `grep -n` 直接查内核日志 | 日志里有 NUL 字节，grep 只回 `Binary file … matches`，第 1 轮的日志分析白跑一遍 | 内核日志一律 `grep -a`（`tools/journal_run_report.sh` 已改） |
 | 41 | 敲了一条不带长度的 `pinfile rawread` | 它开始把整份 17 GB 镜像往 stdout 吐，差点把 adb 拖死 | `rawread` 必须带 BYTES，或改用 `rawreadat PATH DEV OFFSET LEN`（带诊断前缀，按 HFSX 签名定位） |
 | 42 | 以为 `guestmount` 里的 `st_ino` 是真的 | 两条硬链接路径报 ino=4 / ino=11（FUSE 自己编的号）；若照这个用 `rsync -H`，3140 个 cryptex 硬链接会被展开成两倍数据，16 GiB 装不下 | 硬链接分组只认 guestfish `stat`（它给的是驱动真 ino）；FUSE 视图的 inode 不可信 |
