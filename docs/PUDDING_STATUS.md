@@ -1073,3 +1073,25 @@ Back 能退回到 Wi-Fi 屏。也就是说这是 **"Connect to Mac or PC" 的等
 结论：**激活这条线要动的是 mad 的崩溃本身，不是它的数据**。下一步应该在用户态层面查
 `copyReverseProxyDictionary` 的断言（比如用 `pandora_cat` 读它崩溃前的日志、或按 myron 的
 AEGIRPOSTER 思路做一个注入 dylib 的钩子），而不是继续喂数据。
+
+### 12:30 假网卡的第一步：`ifnet_attach` 返回 ENODEV
+
+在 `bsd/net/if_loop.c` 里加了 `pandora_fake_en=1`：照 `loopattach()` 的写法再 alloc 一个
+名字 `en0`、type `IFT_ETHER`、family `IFNET_FAMILY_ETHERNET` 的接口并 attach。结果：
+
+```
+[0.181] PANDORA NET: en0 attach failed 19        (ENODEV)
+```
+
+`ENODEV` 表示 `ifnet_attach` 找不到这个 family 的模块 —— 以太网需要
+`ether_if_module_init()`（`bsd/net/ether_if_module.c`）注册过，而这个端口里没有任何以太网
+驱动，所以没注册。
+
+下一步（按顺序试）：
+
+1. 在 attach 之前手动调一次 `ether_if_module_init()`（或者找内核里注册 ifmodule 的地方，
+   把 ether 加进去），再 attach；
+2. 如果 ether 模块依赖别的（比如 `proto_register_plumber`），改用 `IFNET_FAMILY_LOOPBACK`
+   但 type 写 `IFT_ETHER`，先看 configd 认不认；
+3. 接口起来之后，用 `pandora_cat` 读 `/private/var/preferences/SystemConfiguration/preferences.plist`
+   确认 configd 有没有给它配上 `192.168.7.2`，再看 Setup 会不会跳过 Wi-Fi。
