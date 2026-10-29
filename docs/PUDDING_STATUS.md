@@ -1020,3 +1020,40 @@ Continue without Wi-Fi。正在按这个顺序跑。
   最早我混用了，导致注入的同时把触摸驱动也打开了。
 
 现在正在跑"点完 Wi-Fi 之后每 25 秒点一次底部按钮"的盲走（run29），目标是走出 Setup 进锁屏/主屏。
+
+### 11:30 现在的真实卡点：Setup 的最后一步要网络或 USB
+
+点掉 "Continue without Wi-Fi" 之后，Setup 进到一个**白底页面**：标题两行 + 一个空框 +
+一个"手机插线"的图标，左上角有 Back。对 y=1200…2200、x=562 逐点试探点击**全都没有反应**，
+Back 能退回到 Wi-Fi 屏。也就是说这是 **"Connect to Mac or PC" 的等待页面**：
+
+- 走 Wi-Fi → 我们没有 Wi-Fi 驱动（内核网络栈只有 lo0/utun）；
+- 走 USB → 我们没有 USB 数据功能（只有充电）；
+- 走"继续" → 那个页面本身就在等线插上，没有可点的"跳过"。
+
+所以 **Setup 卡在最后一步是缺硬件能力，不是缺一个设置**。要过去只有三条路：
+
+1. **让设备"已激活"**，SpringBoard 就会跳过 Setup 直接进锁屏。激活要么让
+   `mobileactivationd` 不崩（它现在在 `copyReverseProxyDictionary` 里断言，
+   补 SystemConfiguration 无效），要么按 ios-sweet 的做法预置 activation data ark
+   （需要先造出 `containers/Data/System/<mad>` 容器）；
+2. **给 iOS 一个"已联网"的接口**：内核里造一个 en0（假的 IONetworkController），
+   配上手工 IP，让 Setup 认为网络可用 —— 上游 ios-sweet 就是靠 USB 网卡做到的；
+3. **打掉 Setup 的判断**：给 SpringBoard 注入一个 dylib（ios-fuxi 的 libfuxi-sb 是同一思路），
+   把 `BYSetupAssistantNeedsToRun` 固定成 NO。
+
+另外这一晚也验证了工具链：
+
+- `pandora_gesture`（0255/0256）能完整走 Setup 前几屏；
+- `pandora_cat`（0253）能读运行中的文件（用它确认了 `SetupDone=true` 确实在文件里）；
+- `pandora_kill`（0257）能在指定时刻杀掉某个进程（还没用上）；
+- 定时帧转储（0260 的 `pandora_fbdump_at`）本地 C++ 编译链还有 `AppleARMBacklight`
+  的老问题，暂时只能靠 present 触发的 dump；
+- `pandora_thumbs`（0250）每 10–20 秒一张缩略图，是现在最可靠的"看屏幕"手段。
+
+### 12:30 交接状态
+
+- 手机在安卓里，pinned 文件健康；镜像 = tweaks 打满、mad 桩、SystemConfiguration 已补；
+- 内核 `relink/kernel-0260`（thumbs + ps + cat + kill + gesture + 定时 dump 的失败版）；
+- 一轮迭代现在 **3–6 分钟**（不恢复镜像），需要干净基线时才 `restore_root.sh`（约 5 分钟 + 首次开机 14 分钟）；
+- 所有结论在上面 + `git log`（仓库 `yechenan/pudding-ios`，最新 `5fac5a0`）。
