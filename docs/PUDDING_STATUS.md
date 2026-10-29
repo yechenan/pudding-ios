@@ -974,3 +974,24 @@ sweetfb_fill=1 sweetnoexec=bluetoothd,fairplayd.H2`，以及 `tools/iosroot_diff
 
 run18 = 手工补一份最小 `preferences.plist`（一个 "USB Ethernet" 服务、192.168.7.2）+ **把真
 mobileactivationd 放回去**（`PD_KEEP_MAD=1`），看 mad 会不会因此不崩、Setup 会不会跳过。
+
+### 10:00 Setup 的 Wi-Fi 有隐藏出口：Continue without Wi-Fi
+
+关键一步是把 `Connect to Mac or PC` 的坐标搞对（我之前按截图估错了 250 px）。按真实按钮矩形
+（y 370–430 / 812）换算到呈现坐标是 **(561, 1200)**，点下去弹出了：
+
+> **Continue without Wi-Fi?**  You need a network connection to set up iCloud and other services.
+> ［Continue］［Use Wi-Fi］
+
+也就是说 Setup **可以不走网络继续**，"Continue" 在 (378, 1383)。这条路上不需要 Wi-Fi
+驱动、不需要 USB 数据、也不需要激活服务器。
+
+另外确认了两个坑：
+
+- `sweetnoexec=Setup` 会让 SpringBoard **永远停在苹果 logo**（它在等 Setup 启动），不能这么屏蔽；
+- `sweetnoexec=mobileactivationd` 也不等价于"没有这个服务"：进程被挡住但 launchd 仍然注册着
+  Mach 服务，客户端会连上去等，整机反而卡死。要"没有激活服务"，只能让 job 表里那条 **没有
+  MachServices**（`/usr/bin/true` 桩）。
+
+现在内核里的手势脚本（`0255`/`0256`）能完整走 Setup：上滑 → Continue → Connect to Mac or PC →
+Continue without Wi-Fi。正在按这个顺序跑。
