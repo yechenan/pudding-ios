@@ -1135,3 +1135,23 @@ level 1 不挂，文件就不存在。
 
 run41 = 打好 cryptex 链接的镜像 + 上游那套启动参数（含 `ignition_level=1`），正在跑。
 如果 Setup 不再出现、直接进锁屏，那说明**我们和上游的差别就是这一步 staging**。
+
+### 14:00 run42：cryptex 链接生效了，但引出两个新问题
+
+镜像补上 cryptex 硬链接 + `/private/var/keybags` 之后，用上游那套参数（`ignition_level=1`）跑：
+
+**修好的**：
+- `PANDORA FILES: systembag.kb -> /private/var/keybags/systembag.kb (78 bytes)` ✓
+- `MKB_INIT: System Keybag loaded` ✓（不再 12 秒重启进恢复模式）
+- `libobjc-trampolines` 错误 **0 次**、SpringBoard 崩溃 **0 次**（之前 208/428 次）→
+  说明 `fuxi-stage-root.py` 那种"把 cryptex 硬链接到根卷"的做法是**对的、必需的**。
+
+**新问题**：
+- SpringBoard 在 12.2 秒就 exec 了（正常要 ~200 秒），然后一直不 present，屏幕停在苹果 logo；
+- `sweetnoexec=bluetoothd,fairplayd.H2` 在我们内核上表现成 "Too many corpses being created"
+  （exec 被挡 → launchd 反复重试），599 秒时内核
+  `kmem_alloc(12963840) failed with 3` → 内存耗尽重启。
+
+结论：**上游的启动参数不能整套照搬**，至少 `sweetnoexec` 这两项对我们有害；
+`ignition_level=1` 现在（有了 cryptex 链接）本身是能用的，但需要单独验证它和 SpringBoard 的关系。
+下一轮：同一镜像（已 staged）+ 我们自己的参数（**不带** ignition_level、**不带** sweetnoexec）。
