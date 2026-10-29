@@ -995,3 +995,28 @@ mobileactivationd 放回去**（`PD_KEEP_MAD=1`），看 mad 会不会因此不�
 
 现在内核里的手势脚本（`0255`/`0256`）能完整走 Setup：上滑 → Continue → Connect to Mac or PC →
 Continue without Wi-Fi。正在按这个顺序跑。
+
+### 10:30 Setup 已经能一路点下去了
+
+顺序（全部用内核手势注入，坐标是 1125×2436）：
+
+```
+90 s  上滑                     hello -> Software Update Complete
+130 s 点 (561,2100)            Continue -> Choose a Wi-Fi Network
+165 s 点 (561,1200)            Connect to Mac or PC -> 弹出 Continue without Wi-Fi?
+210 s 点 (378,1383)            Continue -> 进入下一步（白底、左上角 Back）
+之后每 25 s 点一次 (561,2100)   逐屏推进
+```
+
+踩过的坑：
+
+- **坐标必须按像素量**：截图里 812 高的图，y 要乘 2436/812。我第一次把 y 估大了 250 px，
+  结果点空了，白等了四轮。
+- **帧转储（fbdump）只在有 present 的时候触发**，Setup 的静态界面几乎不 present，所以
+  "按时间 dump" 抓不到想要的屏；`pandora_fbdump=1`（每次 present 都 dump）能抓到过渡帧，
+  但最后一张经常停在动画中间。要精确截图得把 dump 改成由内核定时线程触发 —— 需要重编
+  `SweetFramebuffer.cpp`，本地 C++ 编译链还有个 `AppleARMBacklight` 的老问题，暂时没做。
+- `pandora_gesture`（0257）和触摸驱动的 `pandora_touch` 是**两个不同的启动参数**，
+  最早我混用了，导致注入的同时把触摸驱动也打开了。
+
+现在正在跑"点完 Wi-Fi 之后每 25 秒点一次底部按钮"的盲走（run29），目标是走出 Setup 进锁屏/主屏。
