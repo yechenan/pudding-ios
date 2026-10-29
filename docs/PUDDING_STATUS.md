@@ -902,3 +902,46 @@ Setup 都没出来。
 3. **激活**：mad 的断言在 `copyReverseProxyDictionary`，可以给镜像补
    `/private/var/preferences/SystemConfiguration/preferences.plist`（ios-sweet v14/v15 就是这么干的），
    看看代理字典能不能不再是 NULL。
+
+## 2026-10-29 07:45 **上游找到了：ShueiTsuki/data-a-live（同一台机器，领先很多）**
+
+[github.com/ShueiTsuki/data-a-live](https://github.com/ShueiTsuki/data-a-live) 就是这台
+小米 17 Pro（SM8850）的同一个项目，补丁到 `0293`，README 里写着：
+
+- 锁屏、主屏、自带应用**能进能开**，触摸/电源/音量/亮度可用；
+- 界面由 Adreno 840 的 GPU 合成（自己的 GPU 驱动 + Turnip + NativeMetal）；
+- 电量/温度读真实传感器；ADSP 音频能起、功放卡住；
+- 他们**在 2026-10-22 就第一次把锁屏显示出来了**（build #24）。
+
+我们本地那条线停在 `0240`，之后 `0241–0251` 是我们自己加的（preboot/AMFI/pack/日志/缩略图/
+进程表），和他们的 `0241+`（电量计、USB、温度、音频）是并行的两套编号。
+
+### 最关键的一条：14 分钟是"第一次开机"的 LaunchServices 数据库重建
+
+他们 `PLAN.md` 里早就写了：
+
+> 苹果标志停留：…符号化后 SpringBoard 主线程 **CCSModuleRepository → LSApplicationRecord 等
+> LaunchServices 数据库锁**，t1 在 `__LAUNCH_SERVICES_IS_RESEEDING_ITS_DATABASE_AND_MAY_BLOCK__`
+> 同步等 lsd。即**第一次开机 lsd 重建应用数据库，约 25 分钟以上**（存储驱动慢）。
+
+我们在真机上验证了：
+
+| 这一轮 | 镜像状态 | 界面出现的时刻 | 最后一帧 |
+|---|---|---|---|
+| run10 | 刚恢复的干净镜像（第一次开机） | ~840 s | 856.8 s |
+| run11 | 同一镜像，**不恢复**直接再开 | **~75 s** | 75.5 s |
+| run12 | 再开第三次 | **~70 s** | 70.6 s |
+
+**所以迭代速度可以提高一个数量级**：只要不每次恢复镜像，一轮从 25 分钟降到 4–6 分钟。
+代价是镜像会累积运行期状态，需要在需要干净基线时才恢复。
+
+他们也给了已知可用的启动参数（我们还没全用上）：
+`ignition_level=1 launchd_unsecure_cache=1 wdt=-1 wdt_test=no_user_checkin sweetfb_hz=30
+sweetfb_fill=1 sweetnoexec=bluetoothd,fairplayd.H2`，以及 `tools/iosroot_diff.py`
+（把手机上的镜像和干净基线按 HFS 目录比对，列出运行期改过哪些文件）值得移植。
+
+### run11/run12 的新现象：界面出来后很快黑屏并自动息屏
+
+两轮都是 `display on` ~48 s、最后 present 70–75 s、屏幕从 132 s 起全黑、`display off` 105/196 s。
+界面确实起来了（启动从 14 分钟降到 1 分钟），但**我们没有在它亮着的时候截到图**。
+下一轮把窗口压到 140 s、缩略图每 10 s 一张、帧转储放在 120 s，专门抓这个瞬间。
