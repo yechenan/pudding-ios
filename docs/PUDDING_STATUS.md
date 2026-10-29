@@ -1439,3 +1439,97 @@ Setup 补丁、已建表；固件包 64 MiB 内含完整 GPU 栈（Turnip/插件
 4. **音频**：对齐上游 0263–0313（我们落后 51 个补丁），先搬 `PandoraAudio.cpp`/`pandora_amp`/`pandora_adsp` 与 tunings。
 5. **Wi-Fi**：最重的一块，需要 SM8850 WCN 驱动 + 固件 + 802.11 栈，尚未开始。
 6. 截图（上游 0308–0311）、相机/蜂窝/USB 数据：未开始。
+
+## 2026-10-29 23:20 根卷改成日志式（3 轮硬复位验证）——`clear_dirty_bit.sh` 退休
+
+**做法：不是重建卷，而是把现有卷的日志重新打开。** 预检发现镜像本来是 Apple 的 newfs 格式化的日志式卷：
+卷头 `journalInfoBlock=129`、`/.journal`（8 MiB）、`/.journal_info_block` 都在，日志头是合法的 `JNLx`
+（`start==end`，空日志）。MISTAKES #6 当初只为让 Linux 挂得动，才把卷头 0x2000 位清掉了。所以这一刀
+等价于 macOS 的 `diskutil enableJournal`，**只改 8 个字节**，不搬一个文件：
+
+```
+卷头 attributes (offset 1028)  0x00000100 -> 0x00002100   (kHFSVolumeJournaledMask)
+JIB  flags  (block 129)        0x00000001 -> 0x00000005   (kJIJournalNeedInitMask)
+```
+
+工具：`pudding-standalone/tools/hfs_enable_journal.py`（写前后自检）、`hfs_journal_check.py`
+（按 `hfs_journal.c` 的每条判定验卷头/JIB/日志头）、`hfs_set_journal_bit.py`（临时关位用）。
+
+**为什么设 needInit**：盘上那份日志头是 512 字节块写的（`jhdr_size=512`），XNU 的 `journal_open`
+会走"临时改设备块大小"的旁路；置 needInit 后 `hfs_late_journal_init` 直接 `journal_create()`
+（`hfs_journal.c:1814`），按真实 4 KiB 设备重建一份干净头，不依赖旧内容。
+
+**为什么不用 mkfs+tar**：日志式卷在 Linux hfsplus 驱动上是**只读挂载**（实测 `open: /hello:
+Read-only file system`），要 tar 进新卷必须先清日志位；而且 189k 文件 / 3140 个 cryptex 硬链接
+搬一遍，风险远大于收益。逐字节复制 + 8 字节编辑，`fsck.hfsplus -f -n` 报 `appears to be OK`。
+
+**镜像**：`pudding-hw/rootfs/ios-root-journaled.img`，sha256
+`205369fcccfc4c394dc5afb1b88ed1f695a0e94bf7e07253caefb9110282a7d9`（与源镜像只差这 8 字节）。
+备份 `ios-root-patched.img` = 源镜像 `b58d5735…c3283c4f`。`pinfile rawwrite` 写后 sha256 一致。
+
+**三轮验证（每轮之间不做任何人工修卷）**
+
+| 轮 | 窗口 | 日志 | `hfs_mark_inconsistent` | 进 UI |
+|---|---|---|---|---|
+| j1 | 1000 s | `[0.179] hfs: Initializing the journal (joffset 0x82000 sz 0x800000)` / `jnl: … create: avoiding old sequence number` / `[0.414] mounted iOSRoot` | **0** | 835 s（**assetsd** 卡到 832.96 s 才崩，不是 lsd） |
+| j2 | 无窗口（手动长按电源） | `[0.170] jnl: replay_journal: from: 660480 to: 8324096` / `[0.409] journal replay done.` / 清 24 孤儿文件 + 56 目录 | **0** | 48 s |
+| j3 | 240 s | `[0.178] jnl: replay_journal: from: 406528 to: 8156160` / `[0.408] journal replay done.` / 清 36 文件 + 214 目录 | **0** | 48 s |
+
+每轮之间的卷头：`journaled=1 / clean=0（脏）/ inconsistent=0 / lastMounted='HFSJ'`，JIB needInit
+被 XNU 清回 0（证明 `journal_create()` 真跑了）。**这就是日志式的正常状态：脏、但 0.2 秒自愈。**
+
+**结论**：硬复位不再需要 `clear_dirty_bit.sh`；那个脚本"假装干净"（只改卷头一位、不修元数据）的
+做法可以整个退役。`prepare_run.sh` / `menu.sh` / HANDOFF 里的相关步骤要删掉。
+
+**顺手纠正两个旧认知**
+
+1. **835 秒不是 lsd 建表**：`exec lsd` 在 13.4 s 就发生；真正挡住 SpringBoard 的是 `assetsd`
+   在 832.96 s 前一直不返回（然后 SIGABRT，SpringBoard 立刻 present）。j2/j3 没有这个等待。
+2. **`sweetfb_fill=1` 很贵**：它走的是内核**逐像素软件缩放**（`SweetFramebuffer.cpp:1656-1693`），
+   `SWEET FB: stats … copy avg` 从 **642 µs**（无 fill，j1）涨到 **3646 µs**（有 fill，j3），5.7 倍，
+   占 60 Hz 预算 22%。
+
+**本轮固件包**：`work-gpu/iosfw-bb-pad.img`（64 MiB，12 个文件，sha256 `27f34a30…`），
+在 GPU 那套基础上多了 `NativeAdrenoMetal.clients` 里的 `backboardd` 和
+`/private/var/mobile/Library/Preferences/com.apple.backboardd.plist`
+（`CAEnableDeepFramebuffer=false` + 两个压缩关掉）。新工具 `tools/push_fw.sh`（push+rawwrite+校验）。
+
+## 2026-10-29 23:25 GPU 合成接管成功：25 fps → 49~81 fps，"滑动很流畅"（用户目视）
+
+只改了三样：`NativeAdrenoMetal.clients` 加 `backboardd`、装
+`com.apple.backboardd.plist`（`CAEnableDeepFramebuffer=0` + 两个压缩关）、
+`pandora_gpu_perf=18`（第 18 档 = 1200 MHz；**这个参数是档位号不是 MHz**）。
+
+**决定性的日志行**
+
+```
+[ 13.470] PANDORA GPU: client 0 (backboardd) window 0x100000000+0x100000000
+[ 13.470] PANDORA GPU UC: client 0 opened by backboardd through AGXAccelerator
+[ 13.499] |backboardd| pandora-metal: backboardd has a device; CAEnableDeepFramebuffer 0
+[255.285] PANDORA GPU WATCH: 255 s client 0: backboardd alloc 2563 import 2133 map 4696 free 2506
+          submit 5632 fence 5635; mapped 525 of 4096 MiB, pool 437 of 1024 MiB
+```
+
+**帧率对比**
+
+| | g0（CPU 合成） | g1（backboardd 走 GPU） |
+|---|---|---|
+| `SWEET FB: stats` 窗口 | 600 帧 / 24155 ms = **24.8 fps** | 600 帧 / 7417 ms = **80.9 fps**；9480 ms = 63.3 fps；12217 ms = 49.1 fps |
+| `copy avg` | 3646 µs（fill 的软件放大） | **77–81 µs**（面直接 scanout，不再 CPU 放大） |
+| `waited for the GPU` | 0/600 | 456–574/600（确实在等 GPU 画完） |
+| DCVS | `222 MHz 96%` | 无（钉档后 DCVS 线程不跑） |
+| 进 UI | 835 s（assetsd） | ~48 s |
+
+**结论**：`fill=1` 的 3.6 ms/帧 CPU 放大在 GPU 合成下消失了（77 µs），因为画面现在由 GPU 直接
+写进被 scanout 的 surface；CPU 只剩等 fence + 提交。
+
+**120 Hz 不是 boot-arg**：`SweetFramebuffer.cpp:238` 的 `SWEET_FB_VSYNC_US` 是 16667（60 Hz）
+**编译期常量**，`sweetfb_hz >= 60` 只是把 `fFlushTicks` 设成 1（"present up to 60 Hz"）。
+要 120 Hz 得改这个常量重编内核（C++ 本地编不了，走 CI relink）。
+
+**还剩的小问题**：插件对一些 Metal device 属性没答案
+（`gpuCoreCount` / `maxVertexAmplificationCount` / `maxComputeThreadgroupMemory` / `isLargeMRTSupported` …），
+只是少了特性查询，不影响合成。
+
+**卷**：本轮是第 3 次硬复位后的开机，`replay_journal: from 6684160 to 4964352`（绕回）0.19 秒完成，
+`hfs_mark_inconsistent` 0。

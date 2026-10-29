@@ -12,10 +12,17 @@
 - **已打通：内核 → 用户态 → 跳过 Setup → 锁屏 → 桌面**；触屏、电源/音量键、控制中心、设置均实测可用。
 - 跳过 Setup 靠的是把 SpringBoard 的 `-[SBSetupManager updateInSetupMode]` 在 dyld 缓存 `.21` 里打成 `ret`
   （必须连 CodeDirectory 的 16 KiB 块哈希一起改，否则 4K 校验拒绝、2.8 秒死机）。工具：`tools/patch_dyld_cache.py`。
-- GPU：内核驱动 level 15 + Turnip + Metal 插件都已跑通（`vktest` `vkCreateInstance -> 0`、1181 个 fence、0 SMMU 错误），
-  但**合成仍走 CPU**，而且 CPU 合成在等 GPU fence，所以开 GPU 反而更卡；DVFS 锁在 222 MHz。
-- 还没做：卷改日志式（下一刀）、backboardd 走 GPU、钉频、120 fps、音频、Wi-Fi、截图、相机。
-- 卷目前是**非日志式**：硬复位后要先 `tools/clear_dirty_bit.sh`；卷真损坏才 `restore_root.sh`（12 分钟 + 835 秒建表）。
+- **GPU 合成已经接管（2026-10-29 23:20）**：`NativeAdrenoMetal.clients` 里加了 `backboardd`，并装
+  `com.apple.backboardd.plist`（关掉 deep framebuffer 与两个压缩）。日志有
+  `PANDORA GPU UC: client 0 opened by backboardd through AGXAccelerator` +
+  `pandora-metal: backboardd has a device; CAEnableDeepFramebuffer 0`；
+  实测 `SWEET FB: stats` 从 25 fps / `copy 3646 µs` 变成 **49–81 fps / `copy 77 µs`**，
+  `waited for the GPU` 500+/600（说明确实在等 GPU 画完而不是 CPU 拷贝）。
+  注意：`SWEET_FB_VSYNC_US=16667` 是**编译期常量**，所以 120 Hz 不是 boot-arg，要重编内核。
+- **卷已经是日志式（2026-10-29 23:20）**：`ios-root-journaled.img`（sha256 `205369fc…`），
+  三轮硬复位实测：`replay_journal` 0.2 秒完成、`hfs_mark_inconsistent` 0、进 UI 48 秒。
+  **`tools/clear_dirty_bit.sh` 已退休**，硬复位后不用再清脏位；卷真损坏才 `restore_root.sh`。
+- 还没做：120 fps（要重编内核的 vsync 常量）、音频、Wi-Fi、截图、相机。
 - 上游同机型仓库 `ShueiTsuki/data-a-live` 已到 **0313**，我们内核停在 **0262**（落后 51 个补丁，主要是音频/截图）。
 
 ## 仓库和文件都在哪
@@ -142,6 +149,15 @@ iOS 会一直跑，屏幕上看到什么就停在哪；要回安卓就长按电�
     **不要再用这条参数**；要看画面用 `pandora_thumbs_*`，要全帧就等以后把 dump 的内存改成预分配。
 22. **`pandora_reboot_after` 不传 = 不自动回安卓**。手机停在 iOS，直到长按电源 ~10 秒；
     日志每秒落盘，手动重启后照样能用 `tools/pull_log.sh` 拉回来。`menu.sh` 第 1 项就是这个模式。
+23. **Linux 的 hfsplus 驱动对日志式卷只给只读挂载**（libguestfs/guestmount 都是这个驱动）。
+    要往日志式卷里写（tar-in 之类），必须先用 `tools/hfs_set_journal_bit.py IMG off` 清位、
+    写完 fsck 再用 `on` 设回；设回时 `tools/hfs_enable_journal.py` 还会置 JIB 的 needInit，
+    让 XNU 自己 `journal_create()`，不依赖 mkfs 留下的空日志头。
+24. **`guestmount` 看到的 `st_ino` 是 FUSE 编的**（两条硬链接会显示不同 inode）。要判硬链接
+    必须用 `guestfish` 的 `stat`；照 FUSE 的 inode 用 `rsync -H` 会把 3140 个 cryptex 链接
+    展开成两倍数据，16 GiB 直接装不下。
+25. **`pandora_gpu_perf` 是档位号 1..18，不是 MHz**（`pandora_gpu.c:1018` 的 `gpu_opps[]`；
+    578 MHz 是第 10 档，1200 MHz 是第 18 档）。钉频写 578 会被夹到顶档。
 
 ## 开机菜单（不用电脑也能选 iOS / 安卓，2026-10-29 起）
 

@@ -5,6 +5,13 @@
 
 | # | 错误 | 后果（证据） | 以后的规矩 |
 |---|------|--------------|-----------|
+| 40 | 用 `grep -n` 直接查内核日志 | 日志里有 NUL 字节，grep 只回 `Binary file … matches`，第 1 轮的日志分析白跑一遍 | 内核日志一律 `grep -a`（`tools/journal_run_report.sh` 已改） |
+| 41 | 敲了一条不带长度的 `pinfile rawread` | 它开始把整份 17 GB 镜像往 stdout 吐，差点把 adb 拖死 | `rawread` 必须带 BYTES，或改用 `rawreadat PATH DEV OFFSET LEN`（带诊断前缀，按 HFSX 签名定位） |
+| 42 | 以为 `guestmount` 里的 `st_ino` 是真的 | 两条硬链接路径报 ino=4 / ino=11（FUSE 自己编的号）；若照这个用 `rsync -H`，3140 个 cryptex 硬链接会被展开成两倍数据，16 GiB 装不下 | 硬链接分组只认 guestfish `stat`（它给的是驱动真 ino）；FUSE 视图的 inode 不可信 |
+| 43 | 在 MSYS 脚本里写 `DEV="\\$(readlink -f …)"` | 本地 bash 先求值失败、留下单个反斜杠 → `pinfile rawwrite` 只收到一个 `\`，直接打 usage（写固件包时踩到） | 要让**手机端**展开就写单引号 `DEV='$(readlink -f …)'`，别用双引号加反斜杠 |
+| 44 | 把 `pandora_gpu_perf=578` 当频率用 | 它是 `gpu_opps` 的**档位号 1..18**；578 MHz 是第 10 档，写 578 会被夹到顶档，钉频目的落空 | 改频率前先看 `pandora_gpu.c:1018` 的 `gpu_opps[]` 表 |
+| 45 | 给 `run_boot.sh` 接 `tail -30` | 整轮 1000 秒看不到任何实时进度，用户问“是不是在建表”时只能靠算 | 长任务不要接 `tail`，输出直接落文件后 `tail -f` |
+| 46 | 用 `grep -rl` 全工作区找字符串 | 扫到 4 份 17 GB 镜像，两分钟不出结果 | grep 一律限定目录并排除 `*.img` |
 | 33 | 用 `-e _start` 去链接 C 函数 `_start`（C 符号实际是 `__start`） | 包装器一启动就 `missing symbol called` 崩掉 | C 里写 `void start(void)`，符号才是 `_start`；链接后 `llvm-nm -u` 必须为空（`dyld_stub_binder` 除外） |
 | 34 | `-nostdlib` 编译时没关栈保护 | 二进制引用 `___stack_chk_fail`，运行时 `missing symbol called` → SIGABRT | 静态 iOS 二进制一律加 `-fno-stack-protector -fno-builtin`，并检查 `llvm-nm -u` |
 | 35 | 凭记忆猜 Darwin syscall 号（以为 `getcwd`=326） | 包装器收到 SIGSYS，诊断信息全丢 | 不用没验证过的 syscall；要用就先在真机上单独验一个小程序；诊断优先走 `open/fcntl/write` 这类已验证的调用 |
