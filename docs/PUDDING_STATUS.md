@@ -1305,3 +1305,54 @@ BYSetupAssistantHasCompletedInitialRun():
    相对路径写 `purplebuddy.sentinel` 再 `execve` 真 Setup，第二次启动起 `NeedsToRun=0`；
 3. 固件包已扩到 **16 MiB**（`pinfile create … 16`），以后改 ≤64 MiB 的系统文件不用推整镜像；
 4. 文档里对"日志式卷"的欠账没变：现在每次硬复位后仍要先 `tools/clear_dirty_bit.sh`。
+
+## 2026-10-29 21:00 判定点精确定位到 SpringBoard 的 `-[SBSetupManager updateInSetupMode]`；偏好是活的（有证据）
+
+**先纠正一个之前的错误结论**：我曾怀疑"cfprefsd 没读 `/private/var/mobile/Library/Preferences`"。**这是错的。**
+
+用 `pandora_cat_hex` 在运行中（t=700 s）dump `com.apple.springboard.plist`：
+
+```
+PCAT /private/var/mobile/Library/Preferences/com.apple.springboard.plist size 273
+```
+
+我们写进去的是 **171 字节**，运行时变成 **273 字节**，里面多了系统自己写的
+`SBLastRestoreIdentifier` 等键 —— 说明 cfprefsd **确实读写了这个目录**，偏好通道是通的。
+
+**SpringBoard 的判定链（反汇编，`work-re/sb.dis`）**
+
+```
+-[SBSetupManager updateInSetupMode]
+    ...
+    bl  <BYSetupAssistantNeedsToRun 的 stub>          ; 0x1c5aa5e2c
+    cbz w0, 0x1c5aa5f14                               ; 返回 0 就跳过
+    log "inSetupMode = YES because BYSetupAssistantNeedsToRun() returned YES"
+    b   _setSetupRequiredReason:                      ; 记录原因 → inSetupMode = YES
+-[SBSetupManager _isInSetupMode]  =  (_setupRequiredReason != nil)
+```
+
+所以 **SpringBoard 会调这个函数**，判定点就是它。
+
+**但改了 `BYSetupAssistantNeedsToRun`（返回 0）之后 Setup 仍然启动**，说明补丁**没有真正生效**。已排除的：
+
+- 缓存签名：改了代码 + 同步改了 CodeDirectory 的页哈希后，`check_signature` 报错 0 次（p1 轮），内核不再拒绝；
+- 缓存路径：镜像里 `/System/Library/Caches/com.apple.dyld/…11` 与
+  `/private/preboot/Cryptexes/OS/…/…11` 是同一个 inode，sha256 相同；
+- 补丁后的整份镜像与主机镜像 sha256 一致（`4ea000f8…`）才启动的。
+
+**下一刀（最确定的一步）**：直接给 **SpringBoard 自己的 `-[SBSetupManager updateInSetupMode]` 打成 `ret`**。
+它在同一个 dyld 缓存里（SpringBoard 镜像 `work-re/SpringBoard`，VMA `0x1c5aa5d00` 附近），
+做法与这次相同：改代码 + 重算该 16 KiB 块哈希。这样 `_setupRequiredReason` 永远是 nil，
+`_isInSetupMode` 永远 false，SpringBoard 不会启动 Setup。
+
+**这轮还有一个可复用的基础设施**
+
+- 固件包（`/data/local/tmp/iosfw.img`）已扩到 **16 MiB**，开机 0.88 s 由内核写入；
+  改 ≤64 MiB 的系统文件（plist、dylib、Setup.app 二进制）不再需要推 17 GB 镜像。
+- `tools/clear_dirty_bit.sh` 在**卷本身仍一致**时才有效；多轮硬复位后卷会真的损坏
+  （某轮日志 149 条 `hfs_mark_inconsistent`），这时必须 `restore_root.sh` 重来。
+- `work-inject/setupwrap.c`：用相对路径写哨兵再 `execve` 真 Setup 的包装器（可编译、可运行，
+  这次没能证明有效，但工具留着）。
+
+**当前设备状态**：镜像 = 干净恢复版（原始缓存），固件包 = keybag + 两个偏好（正常 set），
+手机在安卓，`boot_a` 里的开机菜单可用。
