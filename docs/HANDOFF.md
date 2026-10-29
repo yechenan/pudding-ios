@@ -9,17 +9,14 @@
 ## 一分钟现状
 
 - 手机：小米 17（pudding / SM8850），iOS 16.7.16（20H392，iPhone X 的 iPSW）。
-- **已打通：内核 → 用户态 → SpringBoard → 锁屏 → 桌面**（2026-10-29 21:40，Setup 已被跳过）。
-- 跳过 Setup 的关键**不是偏好**，而是把 SpringBoard 的 `-[SBSetupManager updateInSetupMode]`
-  在 dyld 缓存里打成 `ret`（要连 CodeDirectory 的页哈希一起改，否则 4K 校验会拒绝）。
-  细节和字节都在 `PUDDING_STATUS.md` 的 2026-10-29 21:40 那一节。
-- 桌面侧已可用：触摸（`pandora_touch=15`）、电源/音量键（`pandora_keys=3`）、
-  画面铺满（`sweetfb_fill=1`）、CPU 合成显示。
-- 还没做：Wi-Fi（无 WCN 驱动）、音频输出、GPU 合成、USB 数据。
-- 根卷仍是"非日志式"：硬复位后要先 `tools/clear_dirty_bit.sh`（2 秒），
-  卷真的损坏时必须 `restore_root.sh`（12 分钟，且下次启动要重建 LaunchServices 表 ~835 秒）。
-- 上游同机型仓库：`ShueiTsuki/data-a-live`（他们更领先：GPU/音频/触摸全通），
-  镜像侧脚本 `bangprovn/ios-fuxi`。
+- **已打通：内核 → 用户态 → 跳过 Setup → 锁屏 → 桌面**；触屏、电源/音量键、控制中心、设置均实测可用。
+- 跳过 Setup 靠的是把 SpringBoard 的 `-[SBSetupManager updateInSetupMode]` 在 dyld 缓存 `.21` 里打成 `ret`
+  （必须连 CodeDirectory 的 16 KiB 块哈希一起改，否则 4K 校验拒绝、2.8 秒死机）。工具：`tools/patch_dyld_cache.py`。
+- GPU：内核驱动 level 15 + Turnip + Metal 插件都已跑通（`vktest` `vkCreateInstance -> 0`、1181 个 fence、0 SMMU 错误），
+  但**合成仍走 CPU**，而且 CPU 合成在等 GPU fence，所以开 GPU 反而更卡；DVFS 锁在 222 MHz。
+- 还没做：卷改日志式（下一刀）、backboardd 走 GPU、钉频、120 fps、音频、Wi-Fi、截图、相机。
+- 卷目前是**非日志式**：硬复位后要先 `tools/clear_dirty_bit.sh`；卷真损坏才 `restore_root.sh`（12 分钟 + 835 秒建表）。
+- 上游同机型仓库 `ShueiTsuki/data-a-live` 已到 **0313**，我们内核停在 **0262**（落后 51 个补丁，主要是音频/截图）。
 
 ## 仓库和文件都在哪
 
