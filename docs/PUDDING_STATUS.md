@@ -1095,3 +1095,43 @@ AEGIRPOSTER 思路做一个注入 dylib 的钩子），而不是继续喂数据�
    但 type 写 `IFT_ETHER`，先看 configd 认不认；
 3. 接口起来之后，用 `pandora_cat` 读 `/private/var/preferences/SystemConfiguration/preferences.plist`
    确认 configd 有没有给它配上 `192.168.7.2`，再看 Setup 会不会跳过 Wi-Fi。
+
+## 2026-10-29 13:00 **照上游的参数跑：暴露出我们镜像缺的一步（cryptex 硬链接）**
+
+用户要求"完全按上游的办法试"。先把上游 `PLAN.md` 里关于激活的结论抄清楚：
+
+> **mobileactivationd 系统容器不存在，激活数据包跳过（激活靠 ADT 的安全状态属性）**
+
+也就是说**上游没有用假网卡**：激活靠 ADT 的 `/chosen` security-status 属性让
+`mobileactivationd` 走本地 Hactivation 分支；启动流程里 Setup 是用偏好直接跳过的
+（构建 #24 用 `ufsrw=1 rootrw=1 sweetfb_noconsole=1 sweetfb_fill=1` 就出了锁屏）。
+
+于是把他们的启动参数整套搬过来跑（run39/run40）：
+
+```
+ignition_level=1 launchd_unsecure_cache=1 wdt=-1 wdt_test=no_user_checkin
+sweetfb_hz=30 sweetfb_fill=1 sweetfb_noconsole=1 sweetnoexec=bluetoothd,fairplayd.H2
+debug=0x8
+```
+
+结果：`libignition: ignition level : 0x1` → `preboot: ignition level insufficient:
+actual = 1, required >= 2`，也就是 **libignition 不再挂 preboot/cryptex**，然后：
+
+```
+|SpringBoard| objc: couldn't dlopen libobjc-trampolines.dylib:
+    '/usr/lib/libobjc-trampolines.dylib' (no such file, not in dyld cache)
+```
+
+SpringBoard **崩了 208 / 428 次**，屏幕一直是苹果 logo。原因很清楚：这个文件在
+`/private/preboot/Cryptexes/{OS,App}` 里，平时是 libignition 在 level≥2 时挂上去的；
+level 1 不挂，文件就不存在。
+
+而上游为什么能这么跑？因为他们的镜像在 `ios-fuxi/tools/fuxi-stage-root.py` 里做了
+**把两个 cryptex 里的每个文件硬链接（或符号链接）到根卷**这一步，我们没做。
+
+已按那个脚本的逻辑给我们的镜像补上：把 `Cryptexes/{OS,App}` 里 3140 个条目逐个
+`ln` 到根卷对应路径（已存在的跳过），验证 `/usr/lib/libobjc-trampolines.dylib` 现在是
+一个 68080 字节、链接数 2 的硬链接。
+
+run41 = 打好 cryptex 链接的镜像 + 上游那套启动参数（含 `ignition_level=1`），正在跑。
+如果 Setup 不再出现、直接进锁屏，那说明**我们和上游的差别就是这一步 staging**。
