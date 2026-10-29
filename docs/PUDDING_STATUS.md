@@ -1533,3 +1533,49 @@ Read-only file system`），要 tar 进新卷必须先清日志位；而且 189k
 
 **卷**：本轮是第 3 次硬复位后的开机，`replay_journal: from 6684160 to 4964352`（绕回）0.19 秒完成，
 `hfs_mark_inconsistent` 0。
+
+## 2026-10-30 00:00 音频：本地能编，但**不能拿不同来源的对象拼内核**（三次 panic 的结论）
+
+**目标**：把上游 `data-a-live@a407d8e2` 的音频实现搬进来（`wsl/pandora_amp.c` 71.5 KB、
+`wsl/pandora_adsp.c` 113.5 KB、`wsl/PandoraAudio.cpp` 45.1 KB —— 我们是 0240 时代：32.7 / 80.1 / 无）。
+
+**已经打通的（可复用）**
+
+1. **本地能编 bsd/dev 的 .c 和 iokit 的 .cpp**：`work-audio/cc.sh`、`work-audio/ccpp.sh`
+   用 `cc_cmd.txt`/`cc_cpp2.txt`（CI 抓的 clang 行）改路径 + `-target arm64-apple-macos12`
+   + `-I …/DEVELOPMENT_ARM64_PANDORA/{bsd,iokit}/DEVELOPMENT`（`meta_features.h` 在那）。
+   命令在 WSL 里 `cd /root/apple` 执行（`/root/apple` 是指向工作区的符号链接，绕开中文路径）。
+2. **Apple clang 的 builtin 要 stub**：`work-audio/stubs.h` 里把 `__builtin_xnu_type_summary` /
+   `_type_signature` / `_types_compatible` 定义成函数式宏（0/0/1），否则 C++ 头
+   （`OSData.h`、`IOLib.h:980` 的 `IOOverrideTypedOperators`）报 73 个
+   `'T' does not refer to a value`。这就是上游 `xnu-cc.py` 干的事。
+3. 上游 amp/adsp/gpi + PandoraAudio 都能零错误编出对象（只多要两个头：
+   `pandora_battery.h`、`pandora_gpi.h` 的新版）。
+4. **链接要用 cctools-port 的 ld64**（`/opt/ld64/bin/aarch64-apple-darwin-ld`）+ 同目录 strip：
+   `ld64.lld` 产出 `LC_MAIN`，而 `data-a-live/tools/mkpayload.py` 只认 `LC_UNIXTHREAD`，
+   会报 `required argument is not an integer`。
+
+**三次 panic（教训）**
+
+| 内核 | 组成 | 结果 |
+|---|---|---|
+| `kernel-audio-01` | `/root/rl` 对象 + 我们编的 amp/adsp/gpi + PandoraAudio | panic，`Boot≈0.12 s`，日志没起来 |
+| `kernel-audio-02` | 去掉 SweetAMFI/pandora_preboot 改动 | 同样 panic |
+| **`kernel-ctl-01`** | **一个对象都不换**（纯 `/root/rl` 对象 + 我们的链接脚本） | **也 panic**，`@IOPlatform.cpp:289` |
+
+`IOPlatform.cpp` **在我们的源码树里不存在** → `/root/rl` 那套对象是**比我们树更新的源码**编的
+（上游 0313 时代）。把它和我们从 0262 源码编的对象混在一起 = 嵌合体，早期平台初始化必炸。
+
+**规则（写进 MISTAKES）**：对象集、`link.filelist`、源码树必须**同一来源**；
+`ci4/buildtree/build/xnu.obj/...`（1129 条）与 `/root/rl/...`（1130 条）不是同一代，
+两者混用必然出这种"找不到源码对应文件的 panic"。
+
+**正确的下一步（CI，不要手工拼）**
+
+1. 仓库 `yechenan/data-a-live-fork` 的 `xnu/patches` 只到 **0241**；上游到 **0313**
+   （补丁列表可从 `api.github.com/repos/ShueiTSuki/data-a-live/contents/xnu/patches?ref=a407d8e2` 取）。
+   所以要么把 0242–0262 补进仓库、要么接受 CI 基线更旧。
+2. `PandoraAudio.cpp` 要照 `PandoraAdrenoGpu.cpp` 的方式登记进 iokit 构建清单（wsl staging 脚本）。
+3. 触发 `xnu.yml`（workflow_dispatch，macOS runner，20–30 分钟），拿**同源** objects+kernel。
+4. 真机 loader 已加 `panic_reboot=1`，但 `IOPlatform` 那次 panic 没自动重启 →
+   这个 boot-arg 在 8796 上是否生效要再确认（可能被 `debug=0x0` 或早期阶段绕过）。
