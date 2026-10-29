@@ -1155,3 +1155,55 @@ run41 = 打好 cryptex 链接的镜像 + 上游那套启动参数（含 `ignitio
 结论：**上游的启动参数不能整套照搬**，至少 `sweetnoexec` 这两项对我们有害；
 `ignition_level=1` 现在（有了 cryptex 链接）本身是能用的，但需要单独验证它和 SpringBoard 的关系。
 下一轮：同一镜像（已 staged）+ 我们自己的参数（**不带** ignition_level、**不带** sweetnoexec）。
+
+## 2026-10-29 14:05 run43：`pandora_fbdump_at` 自己就是 600 秒死机的元凶；"没有 UI"是被我们掐死在 lsd 重建里
+
+run43 = 同一 pinned 镜像（已 staged）+ kernel-0262 + **我们自己的默认参数**（无 ignition_level、
+无 sweetnoexec），窗口 900 s：
+
+```
+12.314 exec SpringBoard    ← 和以前一样
+       CRASH 0 次           ← cryptex 链接确实修掉了 libobjc-trampolines 崩溃
+       |SpringBoard| 0 行    ← 一个字都没打印，说明它还没走到首帧
+       无 present、无 exec Setup
+600.187 kmem_alloc(0xfffffff6007e58a0, 12963840, 0x100021): failed with 3 → restart type 4
+```
+
+**新坑（重要）：`pandora_fbdump_at` 会把整轮打死。** 600.187 s 正好是 `pandora_fbdump_at=600` 的时刻：
+定时转储在 `sweet_fb_dump_now()` 里先 `pandora_fbdump_begin()` 要 12.9 MB 缓冲，分配失败 → 内核重启。
+对照：run39（fbdump_at=300）死在 300.175 s；run42（=600）死在 599/600 s；run43 同样。
+**这条参数在 0262 上不能用**，以后一律不带。（顺带记住：`fbdump: no frame dump` 不代表没画面，
+只代表 dump 没成功。）
+
+**"UI 不见了"的真相：lsd 重建要 ~835 秒，我们从没让它活到那时候。**
+
+| 轮次 | SpringBoard 首次 present | 说明 |
+|---|---|---|
+| run37 | **835.3 s** | 镜像刚恢复，lsd 重建 LaunchServices 库（pitfall 1 的 14 分钟） |
+| run38 | 59.1 s | 同一镜像第二次启动 |
+| run41/42/43 | 无 | 13:21 恢复过镜像 → 又回到"第一次"，但窗口 900 s，且 fbdump_at 在 600 s 自灭 |
+
+所以 run41–43 的 "no present / no Setup" 不是新故障，是**同一个 835 秒现象 + 600 秒自灭**。
+规则：任何"看 UI 出不出来"的轮次，窗口必须 ≥1500 s，且不带 fbdump_at。
+
+run44（正在跑）= 同一镜像 + `pandora_thumbs_start=120 pandora_thumbs_every=60`
++ `sweetsample=SpringBoard,backboardd` + `pandora_ps=1200`，窗口 1500 s，**不带 fbdump_at**。
+目标：活着看到 835 s 之后的画面，并拿到 SpringBoard 卡在哪的栈。
+
+### 与上游逐项对齐（按要求直接搬）
+
+- 上游 `ShueiTsuki/data-a-live` 最新提交 10-29 13:48（`0295: audio step 2`），机器是**小米 17 Pro
+  （SM8850，pandora）**，与我们同代；`tools/ios_test.sh` 的启动参数就是 run40/41 用过的那一串
+  （`ignition_level=1 launchd_unsecure_cache=1 wdt=-1 wdt_test=no_user_checkin
+  sweetnoexec=bluetoothd,fairplayd.H2`）。
+- 我们的 `pudding-hw/mkiosroot.sh` 与他们 `ios-fuxi/tools/mkiosroot.sh` **逐字节相同**；
+  `sweet-root-tweaks.py` 的 Setup 段（5 个 plist、`/private/var/mobile/Library/Preferences/`、
+  501:501 0600、binary plist）与我们 `tools/root_tweaks.py` **逐键相同**，从镜像读回来也确认值对
+  （`SetupDone=True`、130 字节二进制 plist）。**因此"抄 Setup 段"是空操作**，差别不在这段文本里。
+- 已定位的一处真实差异：**上游不桩 `mobileactivationd`**（job 表里是真程序、有 MachServices），
+  我们镜像里是 `['/usr/bin/true']` + **0 个 MachServices**。他们的结论是激活走 ADT 安全状态 + 本地
+  Hactivation；我们的 mad 一启动就崩（sig 5），只能桩。下一步要验证"mad 不在"是否正是 SpringBoard
+  判定"要跑 Setup"的原因。
+- 上游 0001–0295 的补丁序列就是我们的来源（我们停在 0262）；0263–0295 全是亮度/音频/oslog/pathlog/
+  installer-rename，**没有一条与 Setup 相关**——他们进桌面用的内核能力我们都有，差别只能在
+  镜像内容 / 启动参数 / 激活状态三者里。
