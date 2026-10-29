@@ -1405,3 +1405,37 @@ hashOffset 189, hashSize 32, hashType 2 (SHA-256), codeLimit 114,900,992
 2. 桌面侧的硬件：触摸/按键已在（本轮同时开着），Wi-Fi、音频、GPU 仍是待做；
 3. 卷仍然是"非日志式"，硬复位后要先 `tools/clear_dirty_bit.sh`；根治仍是重建日志式卷；
 4. 建议把补丁写进镜像的默认构建流程（`ios-root.img` 已含补丁，注意别再被干净副本覆盖）。
+
+## 2026-10-29 22:10 GPU 首次跑通（内核驱动 + Turnip + Metal 插件），但合成仍未走 GPU
+
+`pandora_gpu=15 pandora_gpu_metal=1` + ADT `GPUPOOL=1024` 的一轮（`gpu1`）：
+
+- GPU 驱动 level 15 全过：1 GiB pool @ `pa 0x9bff00000`、GPUCC/GMU/HFI 正常、`HFI response … error 0`；
+- 提交链路：`WPTR 4509`、1181 个 fence / 1181 次中断、**0 次 SMMU 错误**；
+- Turnip：`VKTEST: vkCreateInstance -> 0`，`client 0 opened by vktest through AGXAccelerator`；
+- Metal 插件注册：`AGXAccelerator (IOAcceleratorES) registered, plugin NativeAdrenoMetal`，`mtltest` 也能开 client；
+- 固件包（64 MiB）写入正常：GMU/SQE/ZAP 固件、Turnip、vktest、mtltest、插件 bundle 全到位。
+
+**但 UI 反而更卡**，日志给出原因：
+- `SWEET FB: stats … copy avg 76 us max 222447 us … 3 waited for the GPU` —— CPU 合成在等 GPU fence（最长 222 ms）；
+- `DCVS: busy 0%, 222 MHz 96%` —— DVFS 认为没负载，锁在最低频；
+- `vktest`/`mtltest` 在 196–197 s 抢 GPU/CPU，正好是用户滑动时段。
+
+所以下一步的顺序是：**先把卷改日志式（减少每轮硬复位的代价），再让 backboardd 真正 GPU 合成（clients 加 backboardd）+ 钉频，再谈 120 fps。**
+
+## 2026-10-29 22:10 本轮结束时的状态与下一步清单
+
+**设备状态**：手机在安卓；iOS 镜像（主机 `pudding-hw/rootfs/ios-root.img`，手机 `iosroot-pin.img`）含
+Setup 补丁、已建表；固件包 64 MiB 内含完整 GPU 栈（Turnip/插件/固件/vktest/mtltest）。
+
+**下一步（按优先级）**
+
+1. **卷改日志式**：`mkfs.hfsplus -J -s` 建 16 GiB HFSX → `tar-out`/`tar-in` 保留硬链接搬内容 →
+   推回手机 → 进锁屏 → **硬复位 ×2 验证**无 `hfs_mark_inconsistent`、无需清脏位。
+   备份现镜像为 `ios-root-patched.img` 以便回滚。做完后 `prepare_run.sh` 与文档里的"必须先清脏位"流程删掉。
+2. **GPU 合成接管**：`NativeAdrenoMetal.clients` 加 `backboardd`；`pandora_gpu_perf=578`（或 `_perf_max`）钉频；
+   对比 `SWEET FB: stats` 的 `waited for the GPU` 与帧率。
+3. **120 fps**：`sweetfb_hz=120`（>=60 即每 tick 都拷贝），配合第 2 步观察是否真到 100+ 帧。
+4. **音频**：对齐上游 0263–0313（我们落后 51 个补丁），先搬 `PandoraAudio.cpp`/`pandora_amp`/`pandora_adsp` 与 tunings。
+5. **Wi-Fi**：最重的一块，需要 SM8850 WCN 驱动 + 固件 + 802.11 栈，尚未开始。
+6. 截图（上游 0308–0311）、相机/蜂窝/USB 数据：未开始。

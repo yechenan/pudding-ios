@@ -5,6 +5,13 @@
 
 | # | 错误 | 后果（证据） | 以后的规矩 |
 |---|------|--------------|-----------|
+| 33 | 用 `-e _start` 去链接 C 函数 `_start`（C 符号实际是 `__start`） | 包装器一启动就 `missing symbol called` 崩掉 | C 里写 `void start(void)`，符号才是 `_start`；链接后 `llvm-nm -u` 必须为空（`dyld_stub_binder` 除外） |
+| 34 | `-nostdlib` 编译时没关栈保护 | 二进制引用 `___stack_chk_fail`，运行时 `missing symbol called` → SIGABRT | 静态 iOS 二进制一律加 `-fno-stack-protector -fno-builtin`，并检查 `llvm-nm -u` |
+| 35 | 凭记忆猜 Darwin syscall 号（以为 `getcwd`=326） | 包装器收到 SIGSYS，诊断信息全丢 | 不用没验证过的 syscall；要用就先在真机上单独验一个小程序；诊断优先走 `open/fcntl/write` 这类已验证的调用 |
+| 36 | 把“界面是西班牙语”直接推断成“cfprefsd 没读偏好”，据此否定了整条偏好路线 | 浪费数小时去猜哨兵文件路径；实际偏好是活的（`pandora_cat` dump 从 171 字节长到 273 字节，里面出现系统写的 `SBLastRestoreIdentifier`） | **先做能证伪的测量，再做推断**：怀疑某通道失效，就用 `pandora_cat`/日志证明它到底有没有工作 |
+| 37 | 把反汇编标签前一行 `0x1c5aa5d00` 当成函数起点 | 补丁偏移算错（幸好字节断言拦住，没打错函数） | 函数起点要看标签行本身（这里是 `0x1c5aa5d58`）；打补丁一律用 `tools/patch_dyld_cache.py --dry-run` 先核对字节与哈希槽 |
+| 38 | 把半截下载的 `NativeAdrenoMetal`（1.29 MB，真实 22 MB）当成产物 | 打包内容错，GPU 插件加载不起来 | staging 前必须核对 `SHA256SUMS` / `SHA256SUMS.metal`；大文件下载完先看大小与哈希 |
+| 39 | 往 16 MiB 的 pinned 固件包里塞 39 MB 的 GPU 包 | 写不进（pack 就是那个 pinned 文件本身） | 打包前先算总大小；现在 pinned 文件已 64 MiB，超过就 `pinfile create … 128` 重建并重写 |
 | 32 | 用子缓存头里的 mapping 直接算 VMA→文件偏移就动手打补丁 | 在 `dyld_shared_cache_arm64.21` 上算出的偏移指向了别的函数（幸好补丁前有字节断言拦住） | **打补丁前必须断言目标处的指令字节**；子缓存里的偏移不一定是文件偏移（.11 能用、.21 不行），要先用已知函数序言的字节特征在文件里定位 |
 | 30 | 直接改 dyld 缓存里的代码，没同步改 CodeDirectory 的页哈希 | 内核 4K 缓存校验拒绝：`check_signature[pid:1]: error = 85` → `dyld cache not loaded` → pid 1 起不来，2.8 秒死机，镜像一度不可启动（靠 cryptex 里那份原文没有、只能重新推镜像恢复） | 改缓存 = 改代码 + 重算该 16 KiB 块的 SHA-256 写回 CodeDirectory 槽位（CD 在文件尾 SuperBlob 里）；改前先把原文备份出来（这次幸好 `work-dyld/` 里有） |
 | 31 | 两个 `restore_root.sh`（17 GB）重叠跑 | 两次写同一份 pinned 文件，最后落地的是哪一份不确定（这次靠 sha256 比对才发现是想要的那份） | 一次只跑一个长写盘任务，用 `job_list` 确认没有别的在跑 |
