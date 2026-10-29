@@ -1356,3 +1356,52 @@ PCAT /private/var/mobile/Library/Preferences/com.apple.springboard.plist size 27
 
 **当前设备状态**：镜像 = 干净恢复版（原始缓存），固件包 = keybag + 两个偏好（正常 set），
 手机在安卓，`boot_a` 里的开机菜单可用。
+
+## 2026-10-29 21:40 🎉 跳过 Setup，进锁屏与桌面
+
+**做法**：把 SpringBoard 自己的 setup 判定函数打成 `ret`，它就不会再置 `_setupRequiredReason`，
+`_isInSetupMode` 永远为 false，Setup 便不会被拉起。
+
+补丁（`dyld_shared_cache_arm64.21`，SpringBoard 就在这个子缓存里）：
+
+```
+VMA 0x1c5aa5d58   -[SBSetupManager updateInSetupMode]
+文件偏移 47,537,496   原始 ff c3 01 d1 (sub sp,sp,#0x70)
+                      改成 c0 03 5f d6 (ret)
+```
+
+只改代码会被内核 4K 缓存校验拒绝，所以**同时**改了 CodeDirectory 里该 16 KiB 块的哈希：
+
+```
+SuperBlob 0x6d94000 → CodeDirectory 0x6d94024
+hashOffset 189, hashSize 32, hashType 2 (SHA-256), codeLimit 114,900,992
+槽位 = CD + 189 + (47537496/16384)*32 = 0x6daab81
+旧哈希 fd313283c77d9eeaf9f16076a9ac99ce4004683f613f3160fa1c2e746a54df3d（与原始块一致，已验证）
+新哈希 101ecc39de8e07bbd1e0389aa6b5d7e3…
+补丁后文件 sha256 062103e5872ebfc8a5b4277e21924f206715356cd07e65581d9fb84a75a37e01
+```
+
+**为什么这条路对**（`updateInSetupMode` 的完整判定链，反汇编 `work-re/sb.dis`）：
+
+```
+-[SBSetupManager updateInSetupMode]
+    1) BYSetupAssistantNeedsToRun() == YES        → reason 1（日志明说这句）
+    2) SBLockdownManager 报告设备 bricked          → reason 2（激活失败时成立！）
+    3) 被要求做设备迁移                             → reason 3
+    → _setSetupRequiredReason:(reason)             → _isInSetupMode = (reason != nil)
+```
+
+之前只改 `BYSetupAssistantNeedsToRun` 无效，因为**第 2 条**（激活状态 = bricked）才是我们踩中的那条：
+`mobileactivationd` 被桩掉 → 激活永远不完成 → SBLockdownManager 报 bricked → Setup 照跑。
+把整个函数打成 `ret`，三条路一起关掉。
+
+**验证**：同一镜像（含补丁）+ `pandora_touch=15 pandora_keys=3 sweetfb_fill=1`，
+冷启动 835 秒建表后**直接进锁屏**，上滑即到桌面（用户目视确认：锁屏与桌面都正常）。
+
+**下一步**
+
+1. 把这次补丁做成脚本（`tools/patch_dyld_cache.py <名称> <VMA> <指令字节>`，含 CodeDirectory 哈希修复），
+   以后打任何 dyld 缓存补丁都用它；
+2. 桌面侧的硬件：触摸/按键已在（本轮同时开着），Wi-Fi、音频、GPU 仍是待做；
+3. 卷仍然是"非日志式"，硬复位后要先 `tools/clear_dirty_bit.sh`；根治仍是重建日志式卷；
+4. 建议把补丁写进镜像的默认构建流程（`ios-root.img` 已含补丁，注意别再被干净副本覆盖）。
