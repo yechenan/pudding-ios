@@ -1579,3 +1579,41 @@ Read-only file system`），要 tar 进新卷必须先清日志位；而且 189k
 3. 触发 `xnu.yml`（workflow_dispatch，macOS runner，20–30 分钟），拿**同源** objects+kernel。
 4. 真机 loader 已加 `panic_reboot=1`，但 `IOPlatform` 那次 panic 没自动重启 →
    这个 boot-arg 在 8796 上是否生效要再确认（可能被 `debug=0x0` 或早期阶段绕过）。
+
+## 2026-10-30 07:45 音频驱动第一次真正起来（CI 同源编译的 kernel-audio-04）
+
+**怎么做到的**：把上游 `a407d8e2` 的音频实现打成一个补丁 `0252-pandora-audio.patch`
+（7 文件 / 3493 行：`pandora_amp.c`、`pandora_adsp.c`、`pandora_gpi.c`、两个头、
+新增 `iokit/Kernel/arm/PandoraAudio.cpp`、`iokit/conf/files.arm64` 加一行），push 到
+`yechenan/pudding-ios` 后用 `workflow_dispatch` 触发 `xnu.yml`（macos-14），
+产物 `xnu-kernel` 下载后 `aarch64-apple-darwin-strip -S` → `relink/kernel-audio-04`
+（17,354,120 B，`LC_UNIXTHREAD`）。
+
+**日志（`out/ioslog-a4.txt`，窗口 300 s，`pandora_audio=1`）**
+
+```
+[ 0.125] PANDORA AUDIO Speaker: made: 1 output stream, 48000 Hz, 2 channels, s32, ring 16384 frames
+[ 0.125] PANDORA AUDIO Hawking: registered: 1 input stream, 48000 Hz, 2 channels, s32, ring 16384 frames
+[ 0.125] PANDORA AUDIO Codec: registered: receiver output (mute control, element 3),
+          microphone input (data source selector), 48000 Hz, 2 channels, s32
+[ 0.220] PANDORA ADSP: firmware pack: 12 files
+[ 0.241] PANDORA ADSP: pas 13 init_image (4244 bytes) -> a0 0 a1 0
+[ 0.243] PANDORA ADSP: pas 13 auth_and_reset -> a0 0 a1 0 (1 ms)
+[21.495] PANDORA AUDIO Speaker: registered at 33356 ms (3 s after the ring/silent switch was read, attempt 1)
+[26.546] PANDORA AUDIO Speaker: made: 1 output stream, ... 
+[26.546] PANDORA AUDIO Speaker: not routed within 5 s, plugging it in again
+[300.482] PANDORA: pandora_reboot_after=300 reached, resetting
+```
+
+**结论**
+- 我们自己的 `IOAudio2Device`（Speaker / Hawking / Codec）三个实例都建起来了；
+- ADSP 固件从固件包加载并 `auth_and_reset` 成功；
+- CoreAudio 认领了 Speaker（33356 ms 注册），但 **5 秒内没有路由**（`not routed within 5 s`）
+  → 正是上游 0298–0307（amp power / codec / receiver route / channels / mic / TDM / start levels）那一段；
+- 这轮**没有 panic**，300 s 定时复位准时生效；
+- 用户态在这 300 秒内没起到 SpringBoard（所以屏幕停在 loader 的苹果 logo、无进度条），
+  下一轮用 900–1200 s 窗口看 mediaserverd 之后的路径。
+
+**注意**：`relink/kernel-audio-03` 是本地的实验内核（用上次 CI 的 objects + 3 个 no-op stub 顶住
+`pandora_therm_init`/`pandora_usb_*`），会卡在 logo 且不回安卓——**不要再用它**；
+能用的是 `kernel-audio-04`（CI 同源）。
