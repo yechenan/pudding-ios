@@ -1255,3 +1255,53 @@ run44（正在跑）= 同一镜像 + `pandora_thumbs_start=120 pandora_thumbs_ev
 现在每轮 iOS 启动前都要 `restore_root.sh`（否则脏卷 → 上面那个死循环），代价 12 分钟。
 根治办法是把内容搬进一个 `mkfs.hfsplus -s -J` 的新卷（tar-out/tar-in），或改内核在挂载脏根卷时
 把"脏"当陈旧状态清掉（需要 CI 重编）。
+
+## 2026-10-29 19:00 反汇编定位到 Setup 判定函数；直接给 dyld 缓存打补丁（第一次被签名校验拒绝）
+
+**判定链（完整反汇编，`SetupAssistant.framework`）**
+
+```
+BYSetupAssistantNeedsToRun():            ; 每个普通设备最终都走这条
+    if ([buddyPreferencesInternal boolForKey:@"ForceNoBuddy"]) return 0;
+    if (MGGetBoolAnswer(@"apple-internal-install")) { ...internal 分支... }
+    return !LaunchSentinelExists();      ; ← 普通设备就是这一行
+
+LaunchSentinelExists():
+    fd = open("purplebuddy.sentinel", O_RDONLY);    ; 相对路径！靠 CWD 解析
+    if (fd != -1) close(fd);
+    return fd != -1;
+
+BYSetupAssistantHasCompletedInitialRun():
+    ForceNoBuddy → 1; store demo → 1; 否则 = [com.apple.purplebuddy 域] SetupFinishedAllSteps
+```
+
+**试过、全部无效**（每条都从日志确认了写入成功）：
+
+- 用户域 `com.apple.purplebuddy` 加 `ForceNoBuddy=true`（146 字节 plist，`PANDORA FILES … 146 bytes` 有据）
+- 系统域 `/Library/Preferences/`、`/private/var/preferences/`、`…internal.plist`
+- `purplebuddy.sentinel` 放在 **59 个候选目录**（`/`、`/private/var/*`、SpringBoard.app、SetupAssistant.framework …）
+- `DYLD_INSERT_LIBRARIES` 注入 interpose dylib：iOS 对平台二进制**忽略**（日志里 `NOSETUP` 0 次）
+- 杀 Setup / 用桩替换 Setup.app：**SpringBoard 会等 Setup**，卡苹果 logo
+
+**改 dyld 缓存（当前路线）**
+
+- 目标函数在 `dyld_shared_cache_arm64.11`，文件偏移 **22,073,968**
+- 补丁：`ff 03 02 d1`（`sub sp,sp,#0x80`）→ `00 00 80 52 c0 03 5f d6`（`mov w0,#0; ret`）
+- **第一次直接改代码 → 内核 4K 缓存校验拒绝**：`check_signature[pid:1]: error = 85` →
+  `dyld cache '(null)' not loaded` → launchd 找不到 libSystem → 2.8 秒死。
+  原因是 `cs_native4k_prepare()` 会拿 CodeDirectory 里**原始 16 KiB 块**的 SHA-256 校验整份缓存，
+  而且**没有 boot-arg 能关掉它**。
+- 修复办法（已实施）：**同时改 CodeDirectory 里那一块的哈希**
+  - 签名在文件尾 `0x6e3c000`，CodeDirectory 在 `0x6e3c024`
+  - `hashOffset=189, hashSize=32, hashType=2(SHA-256), codeLimit=115589120`
+  - 目标块 = 22073968/16384 = 第 **1347** 块；槽位 = CD + 189 + 1347×32
+  - 重算该 16 KiB 块的 SHA-256 写回槽位 → 文件 sha256 `a9e27432…`
+- 结果：**内核校验通过、系统正常进入用户态并在建表**（不再 2.8 秒死机）。
+
+**下一步（无人值守中）**
+
+1. 等 1800 秒窗口结束拉日志：确认 `exec Setup` 是否消失、锁屏是否出现；
+2. 若补丁生效但仍有别的问题：用固件包的 **Setup 包装器**（`work-inject/setupwrap.c`）——
+   相对路径写 `purplebuddy.sentinel` 再 `execve` 真 Setup，第二次启动起 `NeedsToRun=0`；
+3. 固件包已扩到 **16 MiB**（`pinfile create … 16`），以后改 ≤64 MiB 的系统文件不用推整镜像；
+4. 文档里对"日志式卷"的欠账没变：现在每次硬复位后仍要先 `tools/clear_dirty_bit.sh`。
