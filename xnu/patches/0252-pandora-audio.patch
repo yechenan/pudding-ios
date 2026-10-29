@@ -1,0 +1,3631 @@
+--- a/bsd/dev/pandora_amp.c
++++ b/bsd/dev/pandora_amp.c
+@@ -25,6 +25,7 @@
+  * has its clocks on, its pins, the SE's firmware, mode and state over 200 ms. Nothing is sent.
+  * pandora_gauge=2 then reads the bq27z561 gauge (0x55) over GPI DMA (pandora_gpi.c), as Android's
+  * i2c-5 does: the SE is GSI-only (spk2). A free GPII of the DT's qcom,gpii-mask is used and closed after.
++ * pandora_gauge=3 keeps reading it every 5 s for the battery service (pandora_gauge_get).
+  */
+ #if defined(PANDORA)
+ #include <sys/param.h>
+@@ -38,6 +39,8 @@
+ #include <vm/vm_kern.h>
+ #include <vm/pmap.h>
+ #include <kern/kalloc.h>
++#include <kern/locks.h>
++#include "pandora_battery.h"
+ #include "pandora_csfw.h"
+ #include "pandora_gpi.h"
+ 
+@@ -391,6 +394,11 @@
+ 	return NULL;
+ }
+ 
++static unsigned pa_chunk;       /* bytes per firmware write transfer, 0 = whole block (0268) */
++static bool pa_check_fw;        /* read the whole firmware back after writing it (0268; off: spk11 matched) */
++#define PA_COEFF 1u                 /* pa_load: the coefficients before the start */
++#define PA_SCENE 2u                 /* pa_load: the music scene before the start */
++
+ /* Every write of one file; with check, unpacked XM blocks are read back. Returns 0 or an errno. */
+ static int
+ pa_write_file(uint8_t addr, const char *what, const uint8_t *file, uint32_t size, bool coeff, const CsfwInfo *info,
+@@ -403,7 +411,12 @@
+ 	int err = 0;
+ 	uint64_t t0 = mach_absolute_time(), ns;
+ 	while (e == CsfwOk && !err && (e = csfw_next(&it, info, &w)) == CsfwOk) {
+-		err = pa_write_block(addr, w.reg, w.data, w.bytes);
++		/* 0268: pa_chunk > 0 writes each block in transfers of that many bytes (whole packed groups),
++		 * 0 in one transfer per block as Android's regmap_raw_write */
++		for (unsigned at = 0; at < w.bytes && !err; at += pa_chunk ? pa_chunk : w.bytes) {
++			const unsigned n = pa_chunk && w.bytes - at > pa_chunk ? pa_chunk : w.bytes - at;
++			err = pa_write_block(addr, w.reg + at, w.data + at, n);
++		}
+ 		writes++;
+ 		bytes += w.bytes;
+ 		if (!err && check && w.type == CSFW_XM_T) {
+@@ -412,13 +425,32 @@
+ 		}
+ 	}
+ 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+-	printf("PANDORA AMP: %#x %s: %u writes, %u bytes in %llu ms, %s%s; %u XM registers read back, %u differ\n", addr,
+-	    what, writes, bytes, ns / 1000000, e == CsfwEnd ? "all of it" : "STOPPED", err ? " (I2C error)" : "", checked,
+-	    bad);
++	printf("PANDORA AMP: %#x %s: %u blocks (transfers of %u), %u bytes in %llu ms, %s%s\n", addr, what, writes,
++	    pa_chunk, bytes, ns / 1000000, e == CsfwEnd ? "all of it" : "STOPPED", err ? " (I2C error)" : "");
++	printf("PANDORA AMP: %#x %s: %u XM registers read back, %u differ\n", addr, what, checked, bad);
+ 	return err ? err : (e == CsfwEnd ? 0 : EINVAL);
+ }
+ 
+ /* A firmware control's register (by its short name), or 0. */
++static uint32_t pa_r_state, pa_r_beat, pa_r_audio;    /* the firmware's controls, from pa_start (0262) */
++static bool pa_ready;                                /* both amps loaded and started (0262) */
++static volatile bool pa_done;                        /* pa_thread finished, ready or not (0268) */
++static bool pa_awake[2];                             /* 0x40, 0x42: the firmware answered on the mailbox (0270) */
++static uint32_t pa_r_calsel, pa_r_actboot;           /* CAL_R_SEL (alg 0x5F210), ALLOW_ACT_BOOT (0x5F224) (0271) */
++/* 0275: what the firmware reports while it plays; Android's mixer dump during playback (speakercheck
++ * raw/during/tinymix_1.txt, bottom amp): AUDIO_EN_STATUS 1, CLOCK_OK 1, SAMPLING_RATE 48000, ERROR 0,
++ * ABNORMAL_MUTE 0, AUDIO_IN_MAX 0x109, VOLTAGE_MAX 0x1a8, CURRENT_MAX 0x172; after playback the last three 2, 0, 0. */
++static const struct {
++	uint32_t alg;
++	const char *name;
++} pa_mon_ctl[8] = {{0x5f212, "AUDIO_EN_STATUS"}, {0x5f212, "CLOCK_OK"}, {0x5f212, "SAMPLING_RATE"},
++    {0x5f212, "ERROR"}, {0x5f21f, "ABNORMAL_MUTE"}, {0x5f210, "AUDIO_IN_MAX"}, {0x5f210, "VOLTAGE_MAX"},
++    {0x5f210, "CURRENT_MAX"}};
++static uint32_t pa_r_mon[8];
++static uint32_t pa_calr[2];                          /* 0x40, 0x42: this phone's calibration, never printed (0271) */
++static bool pa_calr_ok;
++static const CsfwInfo *pa_infop;                     /* the firmware's algorithm list, for the scene at power-up */
++
+ static uint32_t
+ pa_ctl(const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info, uint32_t alg, const char *name)
+ {
+@@ -438,8 +470,17 @@
+  * RESET | EN, then clear RESET). Android's idle dump: core control 0x81, MPU lock reads 0xbeef,
+  * HALO_STATE 2, HALO_HEARTBEAT counting with no audio clock.
+  */
+-static void
+-pa_start(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info)
++static int
++pa_bits(uint8_t addr, uint32_t reg, uint32_t mask, uint32_t val)
++{
++	uint32_t v = 0;
++	int err = pa_reg(addr, reg, &v);
++	return err ? err : pa_write1(addr, reg, (v & ~mask) | (val & mask));
++}
++
++/* MEM_RDY, the MPU and the core out of reset (the part of pa_start that 0265 also does with the clock running). */
++static int
++pa_core_run(uint8_t addr)
+ {
+ 	static const uint16_t group[5] = {0x0, 0x4, 0x8, 0xc, 0x14};   /* XMEM, YMEM, WINDOW, XREG, YREG access */
+ 	int err = pa_write1(addr, 0x2900, 2);
+@@ -451,18 +492,62 @@
+ 		}
+ 	}
+ 	err = err ? err : pa_write1(addr, PA_MPU_LOCK, 0);
++	/* 0270: the values Android writes (regmap trace of a DSP reload, ampfwcheck/amptrace): 0x281, then 0x81.
++	 * cs_dsp_halo_start_core does update_bits on the regmap cache, which still holds the 0x80 that
++	 * cs_dsp_halo_stop_core wrote (0x81 read at probe with EN cleared), so bit 7 goes back in. We read the
++	 * hardware instead, which says 0 after the soft reset, and wrote 0x201 / 0x001: the core then ran into
++	 * MPU violations at once (spk8-spk12). */
++	err = err ? err : pa_write1(addr, PA_HALO_CORE, 0x281u);
++	err = err ? err : pa_write1(addr, PA_HALO_CORE, 0x081u);
++	return err;
++}
++
++/*
++ * 0270: right after the start, as Android's trace shows: the firmware raises the mailbox interrupt (0x10010 bit 31)
++ * within 3 ms; cs35l43_irq clears it (0x10010 <- 0x80000000), the driver writes 0x13020 <- 0x02000003 and reads the
++ * eight mailbox registers from 0x13000 (its log: QUEUE_WT 0x13008, QUEUE_RD 0x13004, MESSAGE 0x2000002, "AWAKE").
++ * Returns whether the firmware answered.
++ */
++static bool
++pa_mbox_after_start(uint8_t addr)
++{
++	uint32_t irq = 0, m[8];
++	bzero(m, sizeof(m));
++	pa_sleep(5);
++	int err = pa_reg(addr, 0x10010, &irq);
++	const bool mbox = !err && (irq & 0x80000000u);
++	err = err ? err : pa_write1(addr, 0x10010, 0x80000000u);
++	err = err ? err : pa_write1(addr, 0x13020, 0x02000003u);
++	pa_sleep(2);
++	err = err ? err : pa_read_regs(addr, 0x13000, m, 8);
++	printf("PANDORA AMP: %#x after start: 0x10010 %#x (mailbox %s), err %d\n", addr, irq, mbox ? "raised" : "not raised",
++	    err);
++	printf("PANDORA AMP: %#x mailbox: %x %x %x %x %x %x %x %x\n", addr, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
++	return mbox && !err;
++}
++
++static void
++pa_start(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info)
++{
+ 	uint32_t core = 0;
+-	err = err ? err : pa_reg(addr, PA_HALO_CORE, &core);
+-	err = err ? err : pa_write1(addr, PA_HALO_CORE, core | 0x201u);
+-	err = err ? err : pa_write1(addr, PA_HALO_CORE, (core | 0x201u) & ~0x200u);
++	int err = pa_core_run(addr);
+ 	if (err) {
+ 		printf("PANDORA AMP: %#x DSP start: I2C error %d\n", addr, err);
+ 		return;
+ 	}
++	pa_awake[addr == 0x42] = pa_mbox_after_start(addr);
+ 	pa_sleep(20);
+ 	const uint32_t r_state = pa_ctl(fw, fw_size, info, info->fw_id, "HALO_STATE");
+ 	const uint32_t r_beat = pa_ctl(fw, fw_size, info, info->fw_id, "HALO_HEARTBEAT");
+ 	const uint32_t r_audio = pa_ctl(fw, fw_size, info, 0x5f212, "AUDIO_STATE");
++	pa_r_state = r_state;
++	pa_r_beat = r_beat;
++	pa_r_audio = r_audio;
++	pa_r_calsel = pa_ctl(fw, fw_size, info, 0x5f210, "CAL_R_SEL");
++	pa_r_actboot = pa_ctl(fw, fw_size, info, 0x5f224, "ALLOW_ACT_BOOT");
++	for (unsigned k = 0; k < 8; k++) {
++		pa_r_mon[k] = pa_ctl(fw, fw_size, info, pa_mon_ctl[k].alg, pa_mon_ctl[k].name);
++	}
+ 	uint32_t lock = 0, mem = 0, state = 0, beat0 = 0, beat1 = 0, audio = 0;
+ 	err = pa_reg(addr, PA_HALO_CORE, &core);
+ 	err = err ? err : pa_reg(addr, PA_MPU_LOCK, &lock);
+@@ -472,24 +557,675 @@
+ 	pa_sleep(100);
+ 	err = err || !r_beat ? err : pa_reg(addr, r_beat, &beat1);
+ 	err = err || !r_audio ? err : pa_reg(addr, r_audio, &audio);
+-	printf("PANDORA AMP: %#x DSP started: core control %#x (Android 0x81), MPU lock %#x (0xbeef), 0x2900 %#x, "
+-	    "HALO_STATE %#x (2), heartbeat %#x -> %#x in 100 ms, AUDIO_STATE %#x, err %d\n", addr, core, lock, mem, state,
+-	    beat0, beat1, audio, err);
+-	if (!err && r_beat && beat0 == beat1) {
+-		/* spk4: the core enabled but not counting, as if unclocked. cs35l43_dsp_preload_ev forces the
+-		 * PLL on (0x2C04 bit 16) before Android's boot-time load when its clock hook is set. */
+-		uint32_t pll = 0;
+-		err = pa_reg(addr, 0x2c04, &pll);
+-		err = err ? err : pa_write1(addr, 0x2c04, pll | 0x10000u);
+-		pa_sleep(50);
+-		err = err ? err : pa_reg(addr, r_beat, &beat0);
++	/* 0267: no more forcing the PLL on when the heartbeat stands (spk4-spk9: it never helped) */
++	printf("PANDORA AMP: %#x DSP started: core %#x (Android 0x81) lock %#x (0xbeef) 0x2900 %#x\n", addr, core, lock,
++	    mem);
++	printf("PANDORA AMP: %#x DSP started: HALO_STATE %#x beat %#x -> %#x AUDIO_STATE %#x err %d\n", addr, state, beat0,
++	    beat1, audio, err);
++}
++
++/*
++ * 0262: once the audio DSP's speaker graph runs (pandora_adsp.c, pandora_spk=3), TDM0 carries the bit clock
++ * (3.072 MHz) the amps' PLL locks to. pandora_amp_tdm looks at whether it does, without playing anything
++ * (no PLAY to the firmware, no calibration; the DSP sends silence):
++ *  A: the configuration Android's idle dump holds where ours differed (ampregcheck diff_spk5.txt: clocking
++ *     0x2C04/0x2D10, the serial port 0x4808-0x4840, routing 0x4C20-0x4C44, gains 0x6000-0x6C04 and the rest
++ *     but the enables, the interrupt registers and status), then the playback routing and enables of
++ *     Android's dump during a playback (speakercheck raw/during: 0x4C00 0x36, 0x2018 0x3721 less bit 0,
++ *     0x4800 0x10001); after 500 ms the state.
++ *  B: the power-up of cs35l43_main_amp_event (ampfwcheck VERIFY.md 4.): the test-key unlock, 0x2084
++ *     0x000F1AA0, lock, 0x2014 GLOBAL_EN 1, 0x2018 bit 0; the state after 500 ms and 3 s; then its power-down.
++ * The state: enables, PLL / clock status 0x2C14 (3 during Android's playback), monitors, the latched and raw
++ * interrupt status 0x10010-0x1001C / 0x10090-0x100A0, the Halo core, MPU lock, HALO_STATE, heartbeat over
++ * 100 ms, AUDIO_STATE.
++ * 0265 (spk7: the clock and the power stage as Android's, the Halo core still 0x1 with the heartbeat at 0):
++ *  - the PLL as Android's set_sysclk does it (pa_sysclk) instead of one write of 0x430;
++ *  - then, if the heartbeat still does not count, the core stopped and started again with the clock running;
++ *  - the Halo registers Android's dump has (pa_halo), and the whole dump after power-up, against Android's
++ *    dump during playback (speakercheck raw/during);
++ *  - the lines short: spk7's long ones were cut by other threads' output.
++ * 0278: Android's chips read with the regmap cache bypassed (idle, both amps): every value here is the chip's but
++ * 0x0104 and 0x0124, which are 1 on the chip (as ours after reset); the 0 of the old dump was the driver's cache
++ * default, the driver never writes them. Left alone now.
++ */
++static const struct {
++	uint32_t reg, v40, v42;
++} pa_cfg[] = {
++	{0x201c, 0x01001010, 0x01001010}, {0x242c, 0x64000000, 0x64000000},
++	{0x3808, 0x40, 0x40}, {0x4808, 0x20200000, 0x20200000},
++	{0x480c, 3, 3}, {0x4810, 1, 0}, {0x4820, 0x20401, 0x20200}, {0x4830, 0x20, 0x20}, {0x4840, 0x20, 0x20},
++	{0x4c20, 0x36, 0x36}, {0x4c24, 0, 0}, {0x4c44, 8, 8}, {0x6000, 0x8004, 0x8004}, {0x6404, 0x02005604, 0x02005604},
++	{0x6800, 0x40405, 0x40405}, {0x6c04, 0x240, 0x240}, {0x7424, 3, 3},
++};
++static void
++pa_state(uint8_t addr, const char *when)
++{
++	static const uint32_t regs[] = {0x2014, 0x2018, 0x2c04, 0x2c14, 0x2038, 0x2040, 0x2044, 0x4300, 0x4304, 0x4800,
++	    0x7400, 0x10010, 0x10014, 0x10018, 0x1001c, 0x10090, 0x10094, 0x10098, 0x1009c, 0x100a0};
++	uint32_t v[sizeof(regs) / 4], core = 0, lock = 0, state = 0, beat0 = 0, beat1 = 0, audio = 0;
++	int err = 0;
++	for (unsigned i = 0; i < sizeof(regs) / 4 && !err; i++) {
++		err = pa_reg(addr, regs[i], &v[i]);
++	}
++	err = err ? err : pa_reg(addr, PA_HALO_CORE, &core);
++	err = err ? err : pa_reg(addr, PA_MPU_LOCK, &lock);
++	err = err || !pa_r_state ? err : pa_reg(addr, pa_r_state, &state);
++	err = err || !pa_r_beat ? err : pa_reg(addr, pa_r_beat, &beat0);
++	pa_sleep(100);
++	err = err || !pa_r_beat ? err : pa_reg(addr, pa_r_beat, &beat1);
++	err = err || !pa_r_audio ? err : pa_reg(addr, pa_r_audio, &audio);
++	printf("PANDORA AMP: %#x %s: 2014 %x 2018 %x 2c04 %x 2c14 %x 2038 %x 2040 %x 2044 %x\n", addr, when, v[0], v[1],
++	    v[2], v[3], v[4], v[5], v[6]);
++	printf("PANDORA AMP: %#x %s: 4300 %x 4304 %x 4800 %x 7400 %x\n", addr, when, v[7], v[8], v[9], v[10]);
++	printf("PANDORA AMP: %#x %s: irq latched %x %x %x %x raw %x %x %x %x %x\n", addr, when, v[11], v[12], v[13],
++	    v[14], v[15], v[16], v[17], v[18], v[19]);
++	printf("PANDORA AMP: %#x %s: core %#x MPU lock %#x HALO_STATE %#x beat %#x -> %#x AUDIO_STATE %#x err %d\n", addr,
++	    when, core, lock, state, beat0, beat1, audio, err);
++}
++
++/* The Halo registers in Android's dump (speakercheck amp_*_regs_before.txt: 0x2BC1000 0x81, MPU 0xffffffff,
++ * 0x2BC3140 0xbeef, 0x2BC5608 0x580, 0x2BC5618 0x660, 0x2BC7000 0x111000, the rest 0). */
++static void
++pa_halo(uint8_t addr, const char *when)
++{
++	static const uint32_t regs[] = {0x2b80000, 0x2b80010, 0x2b805c0, 0x2b805c8, 0x2b805d0, 0x2b805d8, 0x2bc1000,
++	    0x2bc3104, 0x2bc310c, 0x2bc3114, 0x2bc3140, 0x2bc5608, 0x2bc5618, 0x2bc7000, 0x2bc7008};
++	uint32_t v[sizeof(regs) / 4], mpu[20];
++	int err = 0;
++	for (unsigned i = 0; i < sizeof(regs) / 4 && !err; i++) {
++		err = pa_reg(addr, regs[i], &v[i]);
++	}
++	static const uint16_t group[5] = {0x0, 0x4, 0x8, 0xc, 0x14};
++	for (unsigned i = 0; i < 20 && !err; i++) {
++		err = pa_reg(addr, PA_HALO_MPU + 0x18u * (i / 5) + group[i % 5], &mpu[i]);
++	}
++	if (err) {
++		printf("PANDORA AMP: %#x %s: Halo registers: I2C error %d\n", addr, when, err);
++		return;
++	}
++	printf("PANDORA AMP: %#x %s: halo 0 %x rst %x scratch %x %x %x %x core %x\n", addr, when, v[0], v[1], v[2], v[3],
++	    v[4], v[5], v[6]);
++	printf("PANDORA AMP: %#x %s: mpu 3104 %x 310c %x 3114 %x lock %x 5608 %x 5618 %x wdt %x %x\n", addr, when, v[7],
++	    v[8], v[9], v[10], v[11], v[12], v[13], v[14]);
++	unsigned full = 0;
++	for (unsigned i = 0; i < 20; i++) {
++		full += mpu[i] == 0xffffffffu;
++	}
++	printf("PANDORA AMP: %#x %s: mpu access %u of 20 at ffffffff (first %x %x %x %x %x)\n", addr, when, full, mpu[0],
++	    mpu[1], mpu[2], mpu[3], mpu[4]);
++	/* 0267: where the violations were (cs_dsp_halo_bus_error reads HALO_MPU_XM/YM/PM_VIO_ADDR, 0x43100/08/10),
++	 * and the AHB master's error (HALO_AHBM_WINDOW_DEBUG_0/1, base + 0x2040/0x2044), each read on its own. */
++	uint32_t va[3] = {0, 0, 0}, ahb[2] = {0, 0};
++	int e1 = pa_reg(addr, PA_HALO_MPU + 0x100, &va[0]);
++	e1 = e1 ? e1 : pa_reg(addr, PA_HALO_MPU + 0x108, &va[1]);
++	e1 = e1 ? e1 : pa_reg(addr, PA_HALO_MPU + 0x110, &va[2]);
++	int e2 = pa_reg(addr, 0x2b82040, &ahb[0]);
++	e2 = e2 ? e2 : pa_reg(addr, 0x2b82044, &ahb[1]);
++	printf("PANDORA AMP: %#x %s: violation at XM %x YM %x PM %x (err %d); AHB debug %x %x (err %d)\n", addr, when,
++	    va[0], va[1], va[2], e1, ahb[0], ahb[1], e2);
++}
++
++/*
++ * The PLL as Android sets it at each stream start (cs35l43_pcm_hw_params: 0x2C0C GLOBAL_FS 3 = 48 kHz, then
++ * cs35l43_component_set_sysclk with clock 0, the bit clock, 3.072 MHz = code 0x21 of cs35l43_pll_sysclk):
++ * 0x2C04 open loop (bit 11), the reference frequency (bits 5-10), PLL off (bit 4), the source (bits 0-2), closed
++ * loop, PLL on; then FS_MON 0x2D10 (0x3c024 in Android's dumps). Bit 16 (forced on in pa_start, spk4) cleared at
++ * the end: Android's dumps have 0x430.
++ */
++static int
++pa_sysclk(uint8_t addr)
++{
++	int err = pa_bits(addr, 0x2c0c, 0x1f, 3);
++	err = err ? err : pa_bits(addr, 0x2c04, 0x800, 0x800);
++	err = err ? err : pa_bits(addr, 0x2c04, 0x7e0, 0x21u << 5);
++	err = err ? err : pa_bits(addr, 0x2c04, 0x10, 0);
++	err = err ? err : pa_bits(addr, 0x2c04, 0x7, 0);
++	err = err ? err : pa_bits(addr, 0x2c04, 0x800, 0);
++	err = err ? err : pa_bits(addr, 0x2c04, 0x10, 0x10);
++	err = err ? err : pa_write1(addr, 0x2d10, 0x3c024);
++	err = err ? err : pa_bits(addr, 0x2c04, 0x10000, 0);
++	return err;
++}
++
++/*
++ * 0266: the ROM stopped when Android stops it, a few register writes after the reset: cs35l43_probe reads the ids,
++ * writes its patch and the interrupt masks and calls cs35l43_dsp_init, whose cs_dsp_stop stops the watchdog and
++ * the core (cs_dsp_halo_stop_core: EN cleared, HALO_CORE_SOFT_RESET set). Until 0265 the ROM ran on until the
++ * firmware files were read, for the second amp until the first one was loaded (seconds). spk8: the MPU took none
++ * of pa_core_run's writes (access 3 1 ff0000 fffff 0, lock 0x800000, violations in 0x2BC3104/310C/3114) where
++ * Android's dump has 0xffffffff, 0xbeef and none. The MPU before and after the stop: whether the ROM sets it.
++ */
++static int
++pa_rom_stop(uint8_t addr, const char *when)
++{
++	uint32_t core = 0, lock = 0, mpu0 = 0, wdt = 0, rst = 0;
++	int err = pa_reg(addr, PA_HALO_CORE, &core);
++	err = err ? err : pa_reg(addr, PA_MPU_LOCK, &lock);
++	err = err ? err : pa_reg(addr, PA_HALO_MPU, &mpu0);
++	err = err ? err : pa_reg(addr, PA_HALO_WDT, &wdt);
++	err = err ? err : pa_write1(addr, PA_HALO_WDT, wdt & ~1u);
++	err = err ? err : pa_write1(addr, PA_HALO_CORE, core & ~1u);
++	err = err ? err : pa_reg(addr, PA_HALO_RST, &rst);
++	err = err ? err : pa_write1(addr, PA_HALO_RST, rst | 1u);
++	printf("PANDORA AMP: %#x ROM stopped %s: core %#x lock %#x mpu0 %#x wdt %#x (err %d)\n", addr, when, core, lock,
++	    mpu0, wdt, err);
++	if (!err) {
++		pa_halo(addr, "ROM stopped");
++	}
++	return err;
++}
++
++/* The reset as cs35l43_probe does it (reset low, 2.0-2.1 ms, high, 2.0-2.1 ms), then per amp the id, the register
++ * patch, the ROM stopped and all interrupts masked. 0268: also from pa_tdm_thread, since a core the MPU stopped
++ * no longer lets its enable bit be cleared (spk10). */
++static void
++pa_reset(void)
++{
++	static const uint8_t amps[2] = {0x40, 0x42};
++	static const uint32_t masks[3] = {0xffffffffu, 0xffffffffu, 0xffffffffu};
++	pa_gpio(10, 0, 0, 16, 0);
++	pa_gpio(54, 0, 0, 16, 0);
++	pa_sleep(3);
++	pa_gpio(10, 0, 0, 16, 1);
++	pa_gpio(54, 0, 0, 16, 1);
++	pa_sleep(5);
++	for (unsigned i = 0; i < 2; i++) {
++		uint32_t id = 0;
++		int err = pa_reg(amps[i], 0x0, &id);
++		err = err ? err : pa_write1(amps[i], 0x7404, 0x11330000);
++		err = err ? err : pa_write1(amps[i], 0x3850, 0x50000802);
++		if (!err && id == 0x35a43) {
++			(void)pa_rom_stop(amps[i], "right after reset");
++			(void)pa_write_regs(amps[i], 0x10110, masks, 3);
++		}
++	}
++}
++
++static int
++pa_key(uint8_t addr, uint32_t test)
++{
++	int err = pa_write1(addr, 0x40, 0x55);
++	err = err ? err : pa_write1(addr, 0x40, 0xaa);
++	err = err ? err : pa_write1(addr, 0x2084, test);
++	err = err ? err : pa_write1(addr, 0x40, 0xcc);
++	err = err ? err : pa_write1(addr, 0x40, 0x33);
++	return err;
++}
++
++static void pa_dump(uint8_t addr) __unused;    /* comparisons with Android's chip values; not called now */
++static void pa_load(uint8_t addr, char side, unsigned what);
++
++/* 0275: the firmware's playback readouts (pa_mon_ctl), one line */
++static void
++pa_levels(uint8_t addr, const char *when)
++{
++	uint32_t v[8];
++	int err = 0;
++	for (unsigned k = 0; k < 8; k++) {
++		v[k] = 0;
++		if (pa_r_mon[k] && !err) {
++			err = pa_reg(addr, pa_r_mon[k], &v[k]);
++		}
++	}
++	printf("PANDORA AMP: %#x %s: en %x clock %x rate %u error %x mute %x in max %#x V max %#x I max %#x, err %d\n",
++	    addr, when, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], err);
++}
++
++/* 0271: the music scene laid on the running DSP when the main amp powers up, as cs35l43_main_amp_event does
++ * (cs35l43_apply_delta_tuning: request_firmware of the delta file, then cs_dsp_load_coeff). */
++static int
++pa_scene(uint8_t addr, char side)
++{
++	char name[48];
++	uint32_t size = 0;
++	snprintf(name, sizeof(name), "%c-cs35l43-delta-music-spk-prot.bin", side);
++	uint8_t *d = pa_fw_file(name, &size);
++	int err = ENOENT;
++	if (d && pa_infop) {
++		err = pa_write_file(addr, "music scene", d, size, true, pa_infop, true);
++	}
++	if (d) {
++		kfree_data(d, (vm_size_t)size);
++	}
++	return err;
++}
++static uint32_t pa_xm0;         /* XM word 0 as loaded (the id header's core id), for the restart check */
++
++/*
++ * 0298: with pandora_spk_live the amps' power follows the speaker's IO (PandoraAudio.cpp startIO / stopIO), as on
++ * Android and iOS. Android (ftrace of both amps around a 0.3 s AudioTrack beep, D:\DeepSeekHarness\ampfwcheck
++ * amptrace/beep1_first_play_trace.txt, beep2_second_play_trace.txt): AudioFlinger's output goes to standby 2 s after
++ * the sound ("Standby delay ns=2000000000"), PAL closes the stream and cs35l43_main_amp_event powers both amps down
++ * at once (the TDM link's pmdown_time of 5000 ms is not waited for); the next sound powers them up in about 5 ms
++ * each, without the music scene or the first play's writes. iOS: HAL stops the speaker's IO about 2 s after a sound
++ * (aud26: the player finished at 148.8 s, IO stopped at 150.9 s). So: down when the IO stops; up before the IO's
++ * start returns, so that its clock starts with the amps playing and nothing of the sound is lost. The writes are
++ * Android's, in its order. Before a power off or a restart (pandora_amp_final) down, and they stay down.
++ * One thread (pa_tdm_thread, after the first play) does all of it: nothing else uses the amps' bus by then.
++ */
++static volatile uint32_t pa_want;          /* 0300: the mode asked for: PA_OFF, PA_SPEAKER, PA_RECEIVER */
++static volatile uint32_t pa_mode;          /* the mode the amps are in */
++static volatile uint32_t pa_req;           /* bumped with each request (pandora_amp_io, pandora_amp_final) */
++static volatile uint32_t pa_seen;          /* the last request the power thread has dealt with */
++static volatile bool pa_follow;            /* the power thread follows the IO */
++static volatile bool pa_final;             /* power off or restart: down and stay down */
++
++enum { PA_OFF = 0, PA_SPEAKER = 1, PA_RECEIVER = 2 };
++
++/* Both amps up as Android's second play (beep2): routing and noise gate, serial port and enables, then each amp: the
++ * test-key unlock with 0x2084 0x000F1AA0, GLOBAL_EN, 0x2018 bit 0, PLAY with AUDIO_STATE checked. */
++static int
++pa_speaker_up(void)
++{
++	static const uint8_t amps[2] = {0x40, 0x42};
++	int err = 0;
++	for (unsigned i = 0; i < 2 && !err; i++) {
++		err = pa_write1(amps[1 - i], 0x4c00, 0x36);
++	}
++	for (unsigned i = 0; i < 2 && !err; i++) {
++		err = pa_write1(amps[1 - i], 0x6808, 0x3f75);
++	}
++	for (unsigned i = 0; i < 2 && !err; i++) {
++		err = pa_write1(amps[i], 0x4800, 0x10001);
++	}
++	for (unsigned i = 0; i < 2 && !err; i++) {
++		err = pa_write1(amps[i], 0x2018, 0x3720);
++	}
++	for (unsigned i = 0; i < 2 && !err; i++) {
++		err = pa_key(amps[i], 0x000f1aa0);
++		err = err ? err : pa_write1(amps[i], 0x2014, 1);
++		err = err ? err : pa_write1(amps[i], 0x2018, 0x3721);
++		if (!err && pa_awake[i] && pa_r_audio) {
++			uint32_t a = 0;
++			err = pa_write1(amps[i], 0x13020, 0x0b000001u);
++			pa_sleep(3);
++			err = err ? err : pa_reg(amps[i], pa_r_audio, &a);
++			if (!err && a != 1 && a != 2 && a != 6 && a != 7) {
++				printf("PANDORA AMP: %#x PLAY: AUDIO_STATE %#x, NOT playing\n", amps[i], a);
++				err = EIO;
++			}
++		}
++	}
++	return err;
++}
++
++/* One amp's power stage off, as cs35l43_main_amp_event's power-down: 0x2018 bit 0, the test key with 0x2084
++ * 0x000F1AA3, GLOBAL_EN and the serial port off, the power-down done bit (0x10010 bit 16) awaited and cleared. */
++static int
++pa_stage_down(uint8_t amp)
++{
++	int e = pa_write1(amp, 0x2018, 0x20);
++	e = e ? e : pa_key(amp, 0x000f1aa3);
++	pa_sleep(1);
++	e = e ? e : pa_write1(amp, 0x2014, 0);
++	e = e ? e : pa_write1(amp, 0x4800, 0);
++	pa_sleep(1);
++	uint32_t irq = 0;
++	for (unsigned t = 0; t < 100 && !e && !(irq & 0x10000u); t++) {
++		e = pa_reg(amp, 0x10010, &irq);
++		if (!(irq & 0x10000u)) {
++			pa_sleep(1);
++		}
++	}
++	if (!e && !(irq & 0x10000u)) {
++		printf("PANDORA AMP: %#x no power-down done bit after 100 ms\n", amp);
++	}
++	return e ? e : pa_write1(amp, 0x10010, 0x10000);
++}
++
++/* Both amps down as Android (beep1, beep2): enables but bit 0 and 5, then each amp: PAUSE with AUDIO_STATE checked
++ * and its power stage off; then the noise gate and the routing. Every step is tried even after an error. */
++static int
++pa_speaker_down(void)
++{
++	static const uint8_t amps[2] = {0x40, 0x42};
++	int err = 0;
++	for (unsigned i = 0; i < 2; i++) {
++		int e = pa_write1(amps[i], 0x2018, 0x21);
++		err = err ? err : e;
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		int e = 0;
++		if (pa_awake[i] && pa_r_audio) {
++			uint32_t a = 0;
++			e = pa_write1(amps[i], 0x13020, 0x0b000002u);
++			pa_sleep(3);
++			e = e ? e : pa_reg(amps[i], pa_r_audio, &a);
++			if (!e && a != 0 && a != 2 && a != 6) {
++				printf("PANDORA AMP: %#x PAUSE: AUDIO_STATE %#x, NOT paused\n", amps[i], a);
++			}
++		}
++		e = e ? e : pa_stage_down(amps[i]);
++		err = err ? err : e;
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		int e = pa_write1(amps[i], 0x6808, 0x33);
++		err = err ? err : e;
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		int e = pa_write1(amps[i], 0x4c00, 0);
++		err = err ? err : e;
++	}
++	return err;
++}
++
++/*
++ * 0300: the receiver, as Android plays on the earpiece (miccheck\android\probe_earpiece.txt, mixer_paths "handset"):
++ * the top amp only, its DSP bypassed (T PCM Source ASPRX1: 0x4C00 = 0x8; T ASP TX1 Source ASPRX1: 0x4C20 = 0x8),
++ * T Amp Gain 13 (0x6C04 = 0x1A0; the speaker's 18 is 0x240), GPIO 174 low (T Enable RCV Pin Control 0, DT
++ * rcv_gpio_low "pull down"), then the serial port and the power stage as for the speaker. No PLAY: the firmware does not
++ * process this path. Down: the power stage off, the speaker's gain and routing back, GPIO 174 high.
++ */
++static int
++pa_receiver_up(void)
++{
++	if (pa_tlmm) {
++		pa_gpio(174, 0, 1, 2, 0);
++	}
++	int err = pa_write1(0x42, 0x4c00, 0x8);
++	err = err ? err : pa_write1(0x42, 0x4c20, 0x8);
++	err = err ? err : pa_write1(0x42, 0x6c04, 0x1a0);
++	err = err ? err : pa_write1(0x42, 0x4800, 0x10001);
++	err = err ? err : pa_key(0x42, 0x000f1aa0);
++	err = err ? err : pa_write1(0x42, 0x2014, 1);
++	err = err ? err : pa_write1(0x42, 0x2018, 0x21);
++	return err;
++}
++
++static int
++pa_receiver_down(void)
++{
++	int err = pa_stage_down(0x42);
++	int e = pa_write1(0x42, 0x6c04, 0x240);
++	err = err ? err : e;
++	e = pa_write1(0x42, 0x4c20, 0x36);
++	err = err ? err : e;
++	e = pa_write1(0x42, 0x4c00, 0);
++	err = err ? err : e;
++	if (pa_tlmm) {
++		pa_gpio(174, 0, 3, 2, 1);
++	}
++	return err;
++}
++
++static uint64_t
++pa_ms_since(uint64_t t0)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++static const char *const pa_mode_name[3] = {"off", "speaker", "receiver"};
++
++/* The power thread from the first play on (the amps up in speaker mode then): each request ends in the mode it asks
++ * for, through off when it changes. A failed power-up is tried again with the next request only. */
++static void __dead2
++pa_power_loop(void)
++{
++	uint32_t seen = pa_req - 1;            /* the IO's state from before is looked at once */
++	uint64_t since = mach_absolute_time();
++	unsigned ups = 0, downs = 0;
++	pa_mode = PA_SPEAKER;
++	pa_follow = true;
++	printf("PANDORA AMP: power follows the speaker's and the receiver's IO now (up at its start, down at its stop)\n");
++	for (;;) {
++		(void)assert_wait((event_t)&pa_req, THREAD_UNINT);
++		const uint32_t req = __atomic_load_n(&pa_req, __ATOMIC_ACQUIRE);
++		if (req == seen) {
++			(void)thread_block(THREAD_CONTINUE_NULL);
++			continue;
++		}
++		clear_wait(current_thread(), THREAD_AWAKENED);
++		seen = req;
++		const uint32_t want = pa_final || pa_want > PA_RECEIVER ? PA_OFF : pa_want;
++		if (want != pa_mode && pa_mode != PA_OFF) {
++			const uint64_t t0 = mach_absolute_time(), was = pa_ms_since(since);
++			const uint32_t m = pa_mode;
++			const int err = m == PA_RECEIVER ? pa_receiver_down() : pa_speaker_down();
++			pa_mode = PA_OFF;
++			downs++;
++			printf("PANDORA AMP: %s down (%u%s) after %llu ms up, in %llu ms, err %d\n", pa_mode_name[m], downs,
++			    pa_final ? ", final" : "", was, pa_ms_since(t0), err);
++			since = mach_absolute_time();
++		}
++		bool speaker_up = false;
++		if (want != pa_mode) {
++			const uint64_t t0 = mach_absolute_time(), was = pa_ms_since(since);
++			const int err = want == PA_RECEIVER ? pa_receiver_up() : pa_speaker_up();
++			pa_mode = err ? PA_OFF : want;
++			speaker_up = pa_mode == PA_SPEAKER;
++			ups++;
++			printf("PANDORA AMP: %s up (%u) after %llu ms down, in %llu ms, err %d\n", pa_mode_name[want], ups, was,
++			    pa_ms_since(t0), err);
++			since = mach_absolute_time();
++		}
++		__atomic_store_n(&pa_seen, req, __ATOMIC_RELEASE);
++		thread_wakeup((event_t)&pa_seen);
++		/* 0307: the user hears the speaker reach its level about 3 s after a start, the receiver not; iOS's output does
++		 * not rise (0305 levels against the file). The firmware's readouts (its input from the DSP, its voltage out)
++		 * every 100 ms for 6 s after a speaker power-up, next to PandoraAudio's levels of what the DSP got; a new
++		 * request ends them. */
++		for (unsigned k = 1; speaker_up && k <= 60 && __atomic_load_n(&pa_req, __ATOMIC_ACQUIRE) == seen; k++) {
++			char when[24];
++			pa_sleep(100);
++			snprintf(when, sizeof(when), "up +%u ms", k * 100);
++			pa_levels(0x40, when);
++			pa_levels(0x42, when);
++		}
++	}
++}
++
++/* Waits up to MS for the power thread to deal with request REQ. */
++static bool
++pa_wait_req(uint32_t req, unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	for (;;) {
++		(void)assert_wait_deadline((event_t)&pa_seen, THREAD_UNINT, deadline);
++		if ((int32_t)(__atomic_load_n(&pa_seen, __ATOMIC_ACQUIRE) - req) >= 0) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++			return true;
++		}
++		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT) {
++			return (int32_t)(__atomic_load_n(&pa_seen, __ATOMIC_ACQUIRE) - req) >= 0;
++		}
++	}
++}
++
++/* From PandoraAudio.cpp: the mode the amps should be in, 0 off, 1 speaker, 2 receiver (0300; 0298 had on and off).
++ * Waits up to WAIT_MS for it. 0 when they are as asked, ENODEV when the power thread does not run (yet), ETIMEDOUT,
++ * EIO. */
++int pandora_amp_io(int mode, unsigned wait_ms);
++int
++pandora_amp_io(int mode, unsigned wait_ms)
++{
++	pa_want = mode >= PA_OFF && mode <= PA_RECEIVER ? (uint32_t)mode : PA_OFF;
++	const uint32_t req = __atomic_add_fetch(&pa_req, 1, __ATOMIC_ACQ_REL);
++	thread_wakeup((event_t)&pa_req);
++	if (!pa_follow) {
++		return ENODEV;
++	}
++	if (!wait_ms) {
++		return 0;
++	}
++	if (!pa_wait_req(req, wait_ms)) {
++		printf("PANDORA AMP: not %s after %u ms\n", pa_mode_name[pa_want], wait_ms);
++		return ETIMEDOUT;
++	}
++	return pa_mode == pa_want ? 0 : EIO;
++}
++
++/* Before a power off or a restart (PandoraAudio.cpp's power-off and restart message, sweet_ufs.c's
++ * pandora_reboot_after): the amps down, up to 1 s, and they stay down. */
++void pandora_amp_final(const char *why);
++void
++pandora_amp_final(const char *why)
++{
++	if (!pa_follow) {
++		return;
++	}
++	pa_final = true;
++	const uint32_t req = __atomic_add_fetch(&pa_req, 1, __ATOMIC_ACQ_REL);
++	thread_wakeup((event_t)&pa_req);
++	const bool done = pa_wait_req(req, 1000);
++	printf("PANDORA AMP: %s: amps %s\n", why, pa_mode != PA_OFF ? "STILL UP" : done ? "down" : "down?");
++}
++
++static void
++pa_tdm_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	static const uint8_t amps[2] = {0x40, 0x42};
++	/* 0268: the boot-time load (now with the whole firmware read back) may still be going on: wait up to 20 s */
++	for (unsigned t = 0; t < 200 && !pa_done; t++) {
+ 		pa_sleep(100);
+-		err = err ? err : pa_reg(addr, r_beat, &beat1);
+-		err = err ? err : pa_reg(addr, PA_HALO_CORE, &core);
+-		err = err ? err : pa_reg(addr, PA_MPU_LOCK, &lock);
+-		err = err || !r_state ? err : pa_reg(addr, r_state, &state);
+-		printf("PANDORA AMP: %#x PLL forced (0x2c04 %#x -> %#x): core control %#x, MPU lock %#x, HALO_STATE %#x, "
+-		    "heartbeat %#x -> %#x in 100 ms, err %d\n", addr, pll, pll | 0x10000u, core, lock, state, beat0, beat1, err);
++	}
++	/*
++	 * 0280: the top amp's receiver switch, GPIO 174 (DT rcv_gpio_high / rcv_gpio_low on 0x42, mixer "T Enable RCV
++	 * Pin Control", cs35l43_rcv_switch_pinctrl_put: 1 = high "pull up", 0 = low "pull down"). Android's mixer
++	 * default is 1 and only the handset path sets 0; read on Android: "gpio174 : out high func0 2mA pull up".
++	 * Never set by us before 0280: the old state is logged.
++	 */
++	if (pa_tlmm) {
++		const uint32_t rcv_ctl = pa_rd(pa_tlmm, PA_GPIO(174)), rcv_io = pa_rd(pa_tlmm, PA_GPIO(174) + 4);
++		pa_gpio(174, 0, 3, 2, 1);
++		printf("PANDORA AMP: GPIO 174 (top amp receiver switch) was %#x/%u, now %#x/%u (Android: output high)\n",
++		    rcv_ctl, rcv_io & 3u, pa_rd(pa_tlmm, PA_GPIO(174)), pa_rd(pa_tlmm, PA_GPIO(174) + 4) & 3u);
++	}
++	if (!pa_ready) {
++		printf("PANDORA AMP: TDM clock up, but the amps are not loaded and started\n");
++		(void)thread_terminate(current_thread());
++		thread_block(THREAD_CONTINUE_NULL);
++	}
++	/*
++	 * 0270: the cores started at boot with Android's core control values (pa_core_run) and answered on the mailbox,
++	 * or not (pa_awake). No reset or reload here any more. Android's stream start: hw_params (serial port, GLOBAL_FS,
++	 * set_sysclk), routing and enables, then the main amp up; with the firmware awake, PLAY to the mailbox
++	 * (cs35l43_dsp_audio_ev: 0x13020 <- 0x0B000001, AUDIO_STATE 1, 2, 6 or 7 within 2 ms is success), hold, PAUSE
++	 * (0x0B000002, AUDIO_STATE 0, 2 or 6). Not yet: the first-play steps that need this phone's calibration
++	 * (CAL_R_SEL, ALLOW_ACT_BOOT); the audio DSP sends silence.
++	 */
++	for (unsigned i = 0; i < 2; i++) {
++		int err = pa_write1(amps[i], 0x10014, 0xffffffffu);     /* latched status cleared (write 1) */
++		for (unsigned k = 0; k < sizeof(pa_cfg) / sizeof(pa_cfg[0]) && !err; k++) {
++			err = pa_write1(amps[i], pa_cfg[k].reg, i ? pa_cfg[k].v42 : pa_cfg[k].v40);
++		}
++		const int cfg_err = err;
++		err = err ? err : pa_sysclk(amps[i]);
++		/* 0278: as Android's music player start (ftrace of both amps): 0x4C00, the noise gate 0x6808, 0x4800,
++		 * then 0x2018 with bit 0 already set, before the scene and GLOBAL_EN */
++		err = err ? err : pa_write1(amps[i], 0x4c00, 0x36);
++		err = err ? err : pa_write1(amps[i], 0x6808, 0x3f75);
++		err = err ? err : pa_write1(amps[i], 0x4800, 0x10001);
++		err = err ? err : pa_write1(amps[i], 0x2018, 0x3721);
++		printf("PANDORA AMP: %#x configuration (err %d), PLL as set_sysclk, routing, enables: err %d (firmware %s)\n",
++		    amps[i], cfg_err, err, pa_awake[i] ? "awake" : "not awake");
++	}
++	pa_sleep(100);
++	for (unsigned i = 0; i < 2; i++) {
++		pa_state(amps[i], "PLL set");
++		pa_halo(amps[i], "PLL set");
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		/* 0271: the scene first, with the DSP running, as cs35l43_main_amp_event */
++		const int serr = pa_awake[i] ? pa_scene(amps[i], i ? 'T' : 'B') : -1;
++		int err = pa_key(amps[i], 0x000f1aa0);
++		err = err ? err : pa_write1(amps[i], 0x2014, 1);
++		printf("PANDORA AMP: %#x powered up (music scene err %d), err %d\n", amps[i], serr, err);
++	}
++	pa_sleep(500);
++	for (unsigned i = 0; i < 2; i++) {
++		pa_state(amps[i], "up 0.5 s");
++		pa_halo(amps[i], "up 0.5 s");
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		if (!pa_awake[i] || !pa_r_audio) {
++			continue;
++		}
++		/* 0271: the first play after the DSP started (cs35l43_dsp_audio_ev): 0x10110 bit 31 cleared, CAL_R_SEL =
++		 * this amp's calibration, ALLOW_ACT_BOOT = 1; then PLAY */
++		int err = pa_bits(amps[i], 0x10110, 0x80000000u, 0);
++		const bool cal = pa_calr_ok && pa_r_calsel;
++		if (cal) {
++			err = err ? err : pa_write1(amps[i], pa_r_calsel, pa_calr[i]);
++		}
++		if (pa_r_actboot) {
++			err = err ? err : pa_write1(amps[i], pa_r_actboot, 1);
++		}
++		printf("PANDORA AMP: %#x first play: calibration %s, ALLOW_ACT_BOOT %s, err %d\n", amps[i],
++		    cal ? "written" : "missing", pa_r_actboot ? "1" : "not found", err);
++		uint32_t a = 0;
++		err = err ? err : pa_write1(amps[i], 0x13020, 0x0b000001u);
++		pa_sleep(3);
++		err = err ? err : pa_reg(amps[i], pa_r_audio, &a);
++		printf("PANDORA AMP: %#x PLAY: AUDIO_STATE %#x (%s), err %d\n", amps[i], a,
++		    (a == 1 || a == 2 || a == 6 || a == 7) ? "playing" : "NOT playing", err);
++	}
++	/* 0295: boot-arg pandora_spk_live=1: the DSP sends iOS's speaker output (silence between sounds). 0298: from
++	 * here on the amps' power follows the speaker's IO (pa_power_loop); 0300: and the receiver's. */
++	int live = 0;
++	(void)PE_parse_boot_argn("pandora_spk_live", &live, sizeof(live));
++	if (live) {
++		pa_state(0x40, "first play");
++		pa_state(0x42, "first play");
++		pa_power_loop();
++	}
++	/* 0279: 18 s of play (pandora_adsp.c's bottom, top, both pieces end 18 s after the tone starts, about 16 s into
++	 * the play), the firmware's readouts every second. 0278's dump while playing matched Android's chips; not now. */
++	for (unsigned s = 1; s <= 18; s++) {
++		char when[16];
++		pa_sleep(1000);
++		snprintf(when, sizeof(when), "play %u s", s);
++		pa_levels(0x40, when);
++		pa_levels(0x42, when);
++	}
++	pa_state(0x40, "play 18 s");
++	pa_state(0x42, "play 18 s");
++	for (unsigned i = 0; i < 2; i++) {
++		if (!pa_awake[i] || !pa_r_audio) {
++			continue;
++		}
++		uint32_t a = 0;
++		int err = pa_write1(amps[i], 0x13020, 0x0b000002u);
++		pa_sleep(3);
++		err = err ? err : pa_reg(amps[i], pa_r_audio, &a);
++		printf("PANDORA AMP: %#x PAUSE: AUDIO_STATE %#x (%s), err %d\n", amps[i], a,
++		    (a == 0 || a == 2 || a == 6) ? "paused" : "NOT paused", err);
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		uint32_t en = 0, irq = 0;
++		int err = pa_reg(amps[i], 0x2018, &en);
++		err = err ? err : pa_write1(amps[i], 0x2018, en & ~1u);
++		err = err ? err : pa_key(amps[i], 0x000f1aa3);
++		pa_sleep(1);
++		err = err ? err : pa_write1(amps[i], 0x2014, 0);
++		err = err ? err : pa_write1(amps[i], 0x4800, 0);
++		pa_sleep(1);
++		unsigned t = 0;
++		for (; t < 100 && !err && !(irq & 0x10000u); t++) {
++			err = pa_reg(amps[i], 0x10010, &irq);
++			pa_sleep(1);
++		}
++		err = err ? err : pa_write1(amps[i], 0x10010, 0x10000);
++		printf("PANDORA AMP: %#x powered down (0x10010 bit 16 after %u ms), err %d\n", amps[i], t, err);
++	}
++	pa_state(0x40, "powered down");
++	pa_state(0x42, "powered down");
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* From pandora_adsp.c once the speaker graph has started. */
++void pandora_amp_tdm(void);
++void
++pandora_amp_tdm(void)
++{
++	thread_t thread;
++	if (kernel_thread_start(pa_tdm_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
+ 	}
+ }
+ 
+@@ -524,9 +1260,58 @@
+ 	}
+ }
+ 
++/* A file of the pinned pack for others (pandora_adsp.c's speaker graph): kalloc_data'ed, NULL when missing. */
++uint8_t *pandora_fw_file(const char *name, uint32_t *size);
++uint8_t *
++pandora_fw_file(const char *name, uint32_t *size)
++{
++	return pa_fw_file(name, size);
++}
++
++/*
++ * 0268: every firmware block read back whole (spk10: once started, the core is stopped by the MPU at XM 0xffffe,
++ * YM 0x820d6, PM 0x7a90, all outside what the firmware loads: XM to 0x1e7e, YM to 0x7aa, PM to 0xf0c; until now
++ * only the PM's first 128 bytes were read back, and the PM goes in one I2C transfer of 19260 bytes). Reads of
++ * 30 registers from each block's start: whole groups of the packed formats (5 registers per 4 PM instructions,
++ * 3 per 4 XM/YM words), so a read never starts inside a group.
++ */
++static void
++pa_verify_fw(uint8_t addr, const uint8_t *fw, uint32_t fw_size, const CsfwInfo *info)
++{
++	CsfwIter it;
++	CsfwWrite w;
++	unsigned blocks = 0, regs = 0, bad = 0, pm_bad = 0;
++	uint32_t first = 0;
++	int err = 0;
++	uint64_t t0 = mach_absolute_time(), ns;
++	if (csfw_wmfw_begin(&it, fw, fw_size) != CsfwOk) {
++		return;
++	}
++	while (!err && csfw_next(&it, info, &w) == CsfwOk) {
++		if (w.type != CSFW_PM_PACKED_T && w.type != CSFW_XM_PACKED_T && w.type != CSFW_YM_PACKED_T &&
++		    w.type != CSFW_XM_T && w.type != CSFW_YM_T) {
++			continue;
++		}
++		blocks++;
++		for (unsigned at = 0; at < w.bytes && !err; at += 120) {
++			const unsigned n = w.bytes - at > 120 ? 120 : w.bytes - at;
++			const unsigned b = pa_compare(addr, w.reg + at, w.data + at, n, &err);
++			if (b && !bad) {
++				first = w.reg + at;
++			}
++			bad += b;
++			pm_bad += w.type == CSFW_PM_PACKED_T ? b : 0;
++			regs += n / 4;
++		}
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("PANDORA AMP: %#x firmware read back: %u blocks, %u registers, %u differ (%u in PM), first at %#x, "
++	    "%llu ms, err %d\n", addr, blocks, regs, bad, pm_bad, first, ns / 1000000, err);
++}
++
+ /* One amplifier's firmware, coefficients and music scene, checked; with pandora_amp=3 started. */
+ static void
+-pa_load(uint8_t addr, char side)
++pa_load(uint8_t addr, char side, unsigned what)
+ {
+ 	static CsfwInfo info;
+ 	char name[48];
+@@ -546,6 +1331,8 @@
+ 	}
+ 	printf("PANDORA AMP: %#x (%c): firmware %#x version %u.%u.%u, %u algorithms\n", addr, side, info.fw_id,
+ 	    info.fw_ver >> 16, info.fw_ver >> 8 & 0xff, info.fw_ver & 0xff, info.n_algs);
++	pa_xm0 = info.core_id;
++	pa_infop = &info;
+ 	uint32_t core = 0;
+ 	int err = pa_reg(addr, PA_HALO_CORE, &core);
+ 	printf("PANDORA AMP: %#x DSP core control %#x (err %d)\n", addr, core, err);
+@@ -558,17 +1345,9 @@
+ 		err = pa_write1(addr, patch[i][0], patch[i][1]);
+ 	}
+ 	if (!err && (core & 1u)) {
+-		/* Out of reset the core runs its ROM (spk3: 0x81 right after the reset, the serial port at
+-		 * its defaults). cs35l43_dsp_init stops it before anything is written (cs_dsp_stop:
+-		 * cs_dsp_halo_stop_watchdog, then cs_dsp_halo_stop_core: EN cleared, soft reset set). */
+-		uint32_t wdt = 0, rst = 0;
+-		err = pa_reg(addr, PA_HALO_WDT, &wdt);
+-		err = err ? err : pa_write1(addr, PA_HALO_WDT, wdt & ~1u);
+-		err = err ? err : pa_write1(addr, PA_HALO_CORE, core & ~1u);
+-		err = err ? err : pa_reg(addr, PA_HALO_RST, &rst);
+-		err = err ? err : pa_write1(addr, PA_HALO_RST, rst | 1u);
++		/* 0266: normally stopped right after the reset already (pa_rom_stop from pa_thread). */
++		err = pa_rom_stop(addr, "at load");
+ 		err = err ? err : pa_reg(addr, PA_HALO_CORE, &core);
+-		printf("PANDORA AMP: %#x ROM stopped: watchdog %#x, core control now %#x (err %d)\n", addr, wdt, core, err);
+ 		if (!err && (core & 1u)) {
+ 			goto out;
+ 		}
+@@ -587,6 +1366,9 @@
+ 	if (pa_write_file(addr, "firmware", fw, fw_size, false, &info, false)) {
+ 		goto out;
+ 	}
++	if (pa_check_fw) {
++		pa_verify_fw(addr, fw, fw_size, &info);
++	}
+ 	/* What the DSP will read as its id header and algorithm list: as decoded from the file. */
+ 	uint32_t want[10 + 6 * CSFW_MAX_ALGS + 1];
+ 	const unsigned n = 10 + 6 * info.n_algs + 1;
+@@ -622,12 +1404,23 @@
+ 			}
+ 		}
+ 	}
+-	if (err || pa_write_file(addr, "coefficients", c, c_size, true, &info, true)) {
++	if (err) {
+ 		goto out;
+ 	}
+-	if (pa_write_file(addr, "music scene", d, d_size, true, &info, true) == 0 && pa_level >= 3) {
++	/* 0269: what of it goes in before the start (PA_COEFF, PA_SCENE): Android lays the scene (delta tuning) on
++	 * only once the DSP runs (cs35l43_main_amp_event) */
++	printf("PANDORA AMP: %#x before the start: firmware%s%s\n", addr, (what & PA_COEFF) ? ", coefficients" : "",
++	    (what & PA_SCENE) ? ", music scene" : "");
++	if ((what & PA_COEFF) && pa_write_file(addr, "coefficients", c, c_size, true, &info, true)) {
++		goto out;
++	}
++	if ((what & PA_SCENE) && pa_write_file(addr, "music scene", d, d_size, true, &info, true)) {
++		goto out;
++	}
++	if (pa_level >= 3) {
++		pa_halo(addr, "loaded");
+ 		pa_start(addr, fw, fw_size, &info);
+-		pa_dump(addr);
++		pa_halo(addr, "started");
+ 	}
+ out:
+ 	if (fw) {
+@@ -643,11 +1436,17 @@
+ 
+ /*
+  * bq27z561 standard commands (bq27z561.ko's table at .rodata+0x4d8, battcheck VERIFY.md), each a
+- * 2-byte little-endian read after writing the command byte. SCL timing as the SE holds it now (the
+- * last configuration Android's i2c-5 sent before the reboot), else i2c-qcom-geni's 400 kHz entry.
++ * 2-byte little-endian read after writing the command byte. SCL timing and GPII as Android's i2c-5
++ * uses them (gpicheck's live log: config TRE 0x0316050b / 2, transfers on GPII1); the other GPIIs of
++ * the mask only if that one is busy. A complete read becomes the reading pandora_gauge_get hands out.
+  */
+-static void
+-pa_gauge_read(vm_offset_t se)
++LCK_GRP_DECLARE(pg_grp, "pandora_gauge");
++LCK_MTX_DECLARE(pg_lock, &pg_grp);
++static struct pandora_gauge pg_last;
++static PandoraGpi pg_gpi;
++
++static int
++pa_gauge_read(bool log)
+ {
+ 	static const struct {
+ 		uint8_t cmd;
+@@ -655,28 +1454,136 @@
+ 	} q[] = {{0x08, "voltage mV"}, {0x0c, "current mA (+ charging)"}, {0x06, "temperature 0.1 K"},
+ 	         {0x2c, "state of charge %"}, {0x10, "remaining mAh"}, {0x12, "full charge mAh"},
+ 	         {0x3c, "design mAh"}, {0x2a, "cycles"}, {0x2e, "health %"}, {0x0a, "flags"}};
+-	const uint32_t mclk = pa_rd(se, SE_MCLK), scl = pa_rd(se, SE_SCL);
+-	PgpiI2cClock clk = {(uint8_t)((mclk >> 4) & 0xfffu), (uint8_t)((scl >> 20) & 0x3ffu),
+-	                    (uint8_t)((scl >> 10) & 0x3ffu), (uint8_t)(scl & 0x3ffu)};
+-	if (!clk.clk_div || !clk.t_cycle) {
+-		clk = (PgpiI2cClock){2, 5, 12, 24};
+-	}
+-	static PandoraGpi g;
++	const PgpiI2cClock clk = {2, 5, 11, 22};
++	static const uint32_t order[] = {1, 0, 2, 3, 4};
++	PandoraGpi *g = &pg_gpi;
++	g->quiet = !log;
+ 	int e = EBUSY;
+-	for (uint32_t n = 0; n < 12 && e == EBUSY; n++) {
+-		if (PG_GPII_MASK & (1u << n)) {
+-			e = pandora_gpi_open(&g, PG_GPI_PA, PG_GPI_LEN, PG_GPI_EE, n, 5, 3);
++	for (uint32_t i = 0; i < sizeof(order) / sizeof(order[0]) && e == EBUSY; i++) {
++		if (PG_GPII_MASK & (1u << order[i])) {
++			e = pandora_gpi_open(g, PG_GPI_PA, PG_GPI_LEN, PG_GPI_EE, order[i], 5, 3);
+ 		}
+ 	}
+-	printf("PANDORA GAUGE: GPI open %d; clock div %u high %u low %u cycle %u\n", e, clk.clk_div, clk.t_high, clk.t_low,
+-	    clk.t_cycle);
++	if (log || e) {
++		printf("PANDORA GAUGE: GPI open %d; clock div %u high %u low %u cycle %u\n", e, clk.clk_div, clk.t_high,
++		    clk.t_low, clk.t_cycle);
++	}
++	uint16_t v[sizeof(q) / sizeof(q[0])];
+ 	for (unsigned i = 0; i < sizeof(q) / sizeof(q[0]) && !e; i++) {
+-		uint8_t v[2] = {0, 0};
+-		e = pandora_gpi_i2c(&g, &clk, 0x55, &q[i].cmd, 1, v, 2);
+-		printf("PANDORA GAUGE: %#04x %-24s %u (%#06x) err %d\n", q[i].cmd, q[i].what, (unsigned)(v[0] | v[1] << 8),
+-		    (unsigned)(v[0] | v[1] << 8), e);
++		uint8_t b[2] = {0, 0};
++		e = pandora_gpi_i2c(g, &clk, 0x55, &q[i].cmd, 1, b, 2);
++		v[i] = (uint16_t)(b[0] | b[1] << 8);
++		if (log || e) {
++			printf("PANDORA GAUGE: %#04x %-24s %u (%#06x) err %d\n", q[i].cmd, q[i].what, v[i], v[i], e);
++		}
++	}
++	pandora_gpi_close(g);
++	if (!e) {
++		const struct pandora_gauge r = {.valid = 1, .voltage_mv = v[0], .current_ma = (int16_t)v[1],
++		    .temperature_dk = v[2], .soc = v[3], .remaining_mah = v[4], .full_mah = v[5], .design_mah = v[6],
++		    .cycles = v[7], .health = v[8], .status = v[9], .at = mach_absolute_time()};
++		lck_mtx_lock(&pg_lock);
++		pg_last = r;
++		lck_mtx_unlock(&pg_lock);
++	}
++	return e;
++}
++
++bool
++pandora_gauge_get(struct pandora_gauge *g, size_t size)
++{
++	if (size != sizeof(*g)) {
++		return false;
++	}
++	lck_mtx_lock(&pg_lock);
++	*g = pg_last;
++	lck_mtx_unlock(&pg_lock);
++	return g->valid != 0;
++}
++
++/* The bus's clocks on (our votes added to what *BEFORE gets); false when one stays off. */
++static bool
++pg_vote(uint32_t *before)
++{
++	static const uint32_t br[5] = {0x2315c, 0x23148, 0x23140, 0x23144, 0x18508};
++	*before = pa_rd(pa_gcc, PG_VOTE);
++	pa_wr(pa_gcc, PG_VOTE, *before | PG_VOTE_BITS);
++	for (unsigned i = 0; i < 5; i++) {
++		for (unsigned t = 0; t < 10000 && !pa_on(br[i]); t++) {
++			delay(1);
++		}
++		if (!pa_on(br[i])) {
++			printf("PANDORA GAUGE: clock %#x stays off (%#x); SE not read\n", br[i], pa_rd(pa_gcc, br[i]));
++			return false;
++		}
++	}
++	return true;
++}
++
++/* Our votes taken back, the ones that were there before kept. */
++static void
++pg_unvote(uint32_t before)
++{
++	pa_wr(pa_gcc, PG_VOTE, pa_rd(pa_gcc, PG_VOTE) & ~(PG_VOTE_BITS & ~before));
++}
++
++/*
++ * pandora_gauge=3: after the first read at boot, the gauge again every PG_PERIOD_MS, as often as
++ * Android's fg_update_status recomputes the percentage (battui2 §2.2b: 5.08-5.14 s apart in dmesg),
++ * the clocks voted only for the read; at once when pandora_gauge_kick asks (charger plugged or
++ * unplugged). After a read that changes what the battery service shows (percentage, charger,
++ * charging, full), or a kicked one, the service takes it at once, as Android notifies only on such
++ * changes. One line of it in the log for the first, every PG_LOG_EVERY and every kicked read,
++ * errors always.
++ */
++#define PG_PERIOD_MS 5000u
++#define PG_LOG_EVERY 60u
++
++static int pg_wake;
++static int pg_kicked;
++
++void
++pandora_gauge_kick(void)
++{
++	__atomic_store_n(&pg_kicked, 1, __ATOMIC_RELEASE);
++	thread_wakeup(&pg_wake);
++}
++
++static void
++pg_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	struct pandora_battery shown = {0};
++	for (unsigned n = 1;; n++) {
++		/* the flag after assert_wait: a kick before it is seen, one after it wakes the wait */
++		uint64_t deadline;
++		clock_interval_to_deadline(PG_PERIOD_MS, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&pg_wake, THREAD_UNINT, deadline);
++		if (__atomic_load_n(&pg_kicked, __ATOMIC_ACQUIRE)) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++		} else {
++			thread_block(THREAD_CONTINUE_NULL);
++		}
++		const bool kicked = __atomic_exchange_n(&pg_kicked, 0, __ATOMIC_ACQ_REL) != 0;
++		uint32_t before;
++		int e = pg_vote(&before) ? pa_gauge_read(false) : EIO;
++		pg_unvote(before);
++		struct pandora_gauge r;
++		if (e || kicked || n == 1 || n % PG_LOG_EVERY == 0) {
++			(void)pandora_gauge_get(&r, sizeof(r));
++			printf("PANDORA GAUGE: read %u%s err %d: %d mV %d mA %d.%d K %d%% %d/%d mAh status %#x\n", n,
++			    kicked ? " (kicked)" : "", e, r.voltage_mv, r.current_ma, r.temperature_dk / 10,
++			    r.temperature_dk % 10, r.soc, r.remaining_mah, r.full_mah, r.status);
++		}
++		struct pandora_battery b;
++		if (!e && pandora_battery_get(&b, sizeof(b)) &&
++		    (kicked || b.percent != shown.percent || b.external != shown.external || b.charging != shown.charging ||
++		    b.fully_charged != shown.fully_charged)) {
++			shown = b;
++			pandora_battery_changed();
++		}
+ 	}
+-	pandora_gpi_close(&g);
+ }
+ 
+ /*
+@@ -689,23 +1596,13 @@
+ pa_gauge(void)
+ {
+ 	static const uint32_t br[5] = {0x2315c, 0x23148, 0x23140, 0x23144, 0x18508};
+-	const uint32_t vote = pa_rd(pa_gcc, PG_VOTE);
++	uint32_t vote = pa_rd(pa_gcc, PG_VOTE);
+ 	printf("PANDORA GAUGE: vote %#x; branches 2315c %#x 23148 %#x 23140 %#x 23144 %#x 18508 %#x; RCG cmd %#x cfg %#x; "
+ 	    "GPIO52 %#x/%#x GPIO53 %#x/%#x\n", vote, pa_rd(pa_gcc, br[0]), pa_rd(pa_gcc, br[1]), pa_rd(pa_gcc, br[2]),
+ 	    pa_rd(pa_gcc, br[3]), pa_rd(pa_gcc, br[4]), pa_rd(pa_gcc, 0x18518), pa_rd(pa_gcc, 0x1851c),
+ 	    pa_rd(pa_tlmm, PA_GPIO(52)), pa_rd(pa_tlmm, PA_GPIO(52) + 4), pa_rd(pa_tlmm, PA_GPIO(53)),
+ 	    pa_rd(pa_tlmm, PA_GPIO(53) + 4));
+-	pa_wr(pa_gcc, PG_VOTE, vote | PG_VOTE_BITS);
+-	bool on = true;
+-	for (unsigned i = 0; i < 5 && on; i++) {
+-		for (unsigned t = 0; t < 10000 && !pa_on(br[i]); t++) {
+-			delay(1);
+-		}
+-		on = pa_on(br[i]);
+-		if (!on) {
+-			printf("PANDORA GAUGE: clock %#x stays off (%#x); SE not read\n", br[i], pa_rd(pa_gcc, br[i]));
+-		}
+-	}
++	const bool on = pg_vote(&vote);
+ 	vm_offset_t se = on ? ml_io_map_unmappable(PG_SE_PA, 0x4000, VM_WIMG_IO) : 0;
+ 	if (se) {
+ 		printf("PANDORA GAUGE: SE5 fw %#x if_disable %#x dma_mode %#x status %#x cmd %#x irq %#x irq_en %#x "
+@@ -726,12 +1623,15 @@
+ 		}
+ 		printf("PANDORA GAUGE: 200 samples over 200 ms: command active in %u, interrupt status changed %u times\n",
+ 		    busy, changed);
+-		if (pa_gauge_level >= 2 && !busy && !changed) {
+-			pa_gauge_read(se);
++		if (pa_gauge_level >= 2 && !busy && !changed && !pa_gauge_read(true) && pa_gauge_level >= 3) {
++			thread_t thread;
++			if (kernel_thread_start(pg_thread, NULL, &thread) == KERN_SUCCESS) {
++				thread_deallocate(thread);
++			}
+ 		}
+ 		ml_io_unmap(se, 0x4000);
+ 	}
+-	pa_wr(pa_gcc, PG_VOTE, pa_rd(pa_gcc, PG_VOTE) & ~(PG_VOTE_BITS & ~vote));
++	pg_unvote(vote);
+ 	printf("PANDORA GAUGE: vote back to %#x\n", pa_rd(pa_gcc, PG_VOTE));
+ }
+ 
+@@ -743,7 +1643,7 @@
+ 	pa_sleep(8000);
+ 	pa_gcc = ml_io_map_unmappable(PA_GCC_PA, 0x1f0000, VM_WIMG_IO);
+ 	pa_se = ml_io_map_unmappable(PA_SE_PA, 0x4000, VM_WIMG_IO);
+-	pa_tlmm = ml_io_map_unmappable(PA_TLMM_PA, 0xa0000, VM_WIMG_IO);
++	pa_tlmm = ml_io_map_unmappable(PA_TLMM_PA, 0xb0000, VM_WIMG_IO);    /* GPIO 0-175 (0280: 174) */
+ 	if (!pa_gcc || !pa_se || !pa_tlmm) {
+ 		goto out;
+ 	}
+@@ -797,15 +1697,29 @@
+ 	pa_gpio(64, 1, 3, 2, -1);
+ 	pa_gpio(65, 1, 3, 2, -1);
+ 	if (pa_level >= 2) {
+-		/* cs35l43_probe resets them first: reset low, 2.0-2.1 ms, high, 2.0-2.1 ms. */
+-		pa_gpio(10, 0, 0, 16, 0);
+-		pa_gpio(54, 0, 0, 16, 0);
+-		pa_sleep(3);
++		pa_reset();
++	} else {
++		pa_gpio(10, 0, 0, 16, 1);
++		pa_gpio(54, 0, 0, 16, 1);
++		pa_sleep(5);
+ 	}
+-	pa_gpio(10, 0, 0, 16, 1);
+-	pa_gpio(54, 0, 0, 16, 1);
+-	pa_sleep(5);
+ 	static const uint8_t amps[2] = {0x40, 0x42};
++	if (pa_level >= 3) {
++		/* 0271: this phone's calibration, crus_calr.bin from Android's persist partition: two 32-bit little-endian
++		 * words, the first for the top amp (0x42, "T"), the second for the bottom one (0x40, "B"); the registers take
++		 * them as they are (cs35l43_apply_calibration only swaps bytes back). Values not printed. */
++		uint32_t csz = 0;
++		uint8_t *cal = pa_fw_file("crus_calr.bin", &csz);
++		if (cal && csz == 8) {
++			pa_calr[1] = (uint32_t)cal[0] | (uint32_t)cal[1] << 8 | (uint32_t)cal[2] << 16 | (uint32_t)cal[3] << 24;
++			pa_calr[0] = (uint32_t)cal[4] | (uint32_t)cal[5] << 8 | (uint32_t)cal[6] << 16 | (uint32_t)cal[7] << 24;
++			pa_calr_ok = true;
++		}
++		printf("PANDORA AMP: calibration file %s (%u bytes)\n", cal ? "in the pack" : "not in the pack", csz);
++		if (cal) {
++			kfree_data(cal, (vm_size_t)csz);
++		}
++	}
+ 	for (unsigned i = 0; i < 2; i++) {
+ 		uint32_t devid = 0, revid = 0;
+ 		int e1 = pa_reg(amps[i], 0x0, &devid);
+@@ -826,10 +1740,13 @@
+ 		printf("PANDORA AMP: %#x interrupt masks written err=%d, read err=%d: %08x %08x %08x\n", amps[i], e4, e5,
+ 		    back[0], back[1], back[2]);
+ 		if (pa_level >= 2 && !e1 && devid == 0x35a43) {
+-			pa_load(amps[i], i ? 'T' : 'B');
++			/* 0270: firmware and coefficients; the scene once the DSP runs, as Android (not yet) */
++			pa_load(amps[i], i ? 'T' : 'B', PA_COEFF);
+ 		}
+ 	}
++	pa_ready = pa_level >= 3 && pa_r_beat != 0;
+ out:
++	pa_done = true;
+ 	printf("PANDORA AMP: done\n");
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+--- a/bsd/dev/pandora_adsp.c
++++ b/bsd/dev/pandora_adsp.c
+@@ -46,6 +46,7 @@
+ #include <pexpert/device_tree.h>
+ #include <vm/vm_kern.h>
+ #include <vm/pmap.h>
++#include <kern/kalloc.h>
+ #include <arm/caches_internal.h>
+ #include "qcom/QcomSmem.h"
+ #include "qcom/QcomSmp2p.h"
+@@ -814,7 +815,7 @@
+ 	uint32_t bells[2];                       /* doorbells seen: SMP2P, GLINK */
+ 	struct {
+ 		uint8_t agreed, broken;
+-		uint32_t unknown, bells;
++		uint32_t unknown;
+ 	} shown;                                 /* what gl_report printed last */
+ };
+ static struct edge ed_adsp = {.name = "ADSP", .pid = AD_PID, .item_in = AD_ITEM_P2P_IN,
+@@ -1248,22 +1249,22 @@
+ 	(void)qcom_glink_poll(&e->gl);
+ }
+ 
+-/* What changed in the link since the last report. */
++/* The link's state when it changed (agreed, broken, opens nobody serves) and with FORCE (every 5 s at first, then
++ * every 60 s). 0298: no longer for every doorbell: with the speaker graph up (pandora_spk_live) each 20 ms buffer
++ * rings, and the line filled the log (aud23-aud26). */
+ static void
+ gl_report(struct edge *e, bool force)
+ {
+ 	if (!e->gl_on) {
+ 		return;
+ 	}
+-	uint32_t bells = e->bells[0] + e->bells[1];
+ 	if (!force && e->shown.agreed == e->gl.version_agreed && e->shown.broken == e->gl.broken &&
+-	    e->shown.unknown == e->gl.unknown_opens && e->shown.bells == bells) {
++	    e->shown.unknown == e->gl.unknown_opens) {
+ 		return;
+ 	}
+ 	e->shown.agreed = e->gl.version_agreed;
+ 	e->shown.broken = e->gl.broken;
+ 	e->shown.unknown = e->gl.unknown_opens;
+-	e->shown.bells = bells;
+ 	e->gl.unknown_names[sizeof(e->gl.unknown_names) - 1] = 0;
+ 	printf("PANDORA %s: at %llu ms GLINK version %s%s, messages in %u out %u data %u dropped %u; opens nobody "
+ 	    "serves %u (%s); FIFOs ours %u/%u theirs %u/%u (tail/head); doorbells SMP2P %u GLINK %u; AOP %u other %u "
+@@ -1362,9 +1363,11 @@
+ 			gpr_ask();
+ 		}
+ 	}
++	static uint32_t logged;                  /* 0296: aud22, live play: one line per 20 ms buffer flooded the log */
+ 	for (unsigned i = 0; i < ad_gpr_in.n; i++) {
+ 		GprPacket p;
+-		if (!gpr_decode(ad_gpr_in.m[i].data, ad_gpr_in.m[i].len, &p) && ad_spf.answers + ad_spf.ignored < 8) {
++		if (!gpr_decode(ad_gpr_in.m[i].data, ad_gpr_in.m[i].len, &p) && ad_spf.answers + ad_spf.ignored < 8 &&
++		    logged++ < 64) {
+ 			printf("PANDORA ADSP: GPR in: opcode %#x token %u from domain %u port %#x, %u bytes\n", p.opcode, p.token,
+ 			    p.src_domain, p.src_port, p.size);
+ 		}
+@@ -1411,7 +1414,21 @@
+  *     Android asks the PRM for it (machine_dlkm msm_common_snd_hw_params, D:\DeepSeekHarness\prmcheck:
+  *     PARAM_ID_RSC_AUDIO_HW_CLK, clock 0x200 at 48 kHz x 2 slots x 32 bits, attribute 4 from the DT's
+  *     tdm-clk-attribute, root 0), held 2 s and released.
+- * Nothing plays: the amplifiers are not configured.
++ *  3 (0262): the speaker graph Android opens for a playback (D:\DeepSeekHarness\spkstart, acdbcheck), in its
++ *     order (AGM / PAL, spkstart 1.3): the buffer stays mapped and the clock held; APM_CMD_GRAPH_OPEN with the
++ *     ACDB's subgraph and connection data and APM_CMD_SET_CFG with its calibration, both from spkgraph.bin of
++ *     the pinned pack (tools/spk_graph.py) and sent out of band in the DSP buffer as gsl does; then the
++ *     settings AGM and PAL make at run time, out of band too: the stream MFC (PAL payloadMFCConfig: 48 kHz,
++ *     32 bits, 2 channels L R), the shared-memory endpoint's media format (configure_pcm_shared_mem_ep), the
++ *     TDM endpoint's media format (configure_hw_ep_media_config: 48 kHz, 32 bits, 2 channels, fixed point)
++ *     and its interface (configure_tdm_ep: the ACDB's tag data, primary TDM of LPAIF, 2 slots of 32 bits),
++ *     the PCM decoder's and converter's output (configure_output_media_format: 32 bits, q31, deinterleaved
++ *     unpacked), the SPR's path end and session-time reset (configure_spr); GRAPH_PREPARE and GRAPH_START
++ *     with the four subgraphs. The stream side is our choice (iOS hands its own format): 48 kHz, 32 bits,
++ *     2 channels. Then pandora_amp_tdm looks at the amps on the running clock; after SPK_RUN_MS the graph is
++ *     stopped and closed, the clock released and the buffer unmapped. 0271: the stream gets a quiet 1 kHz
++ *     test tone (spk_tone_pump); before, nothing was written to it and the DSP played silence.
++ * Nothing plays: the amplifiers are not configured (level 3: not told to play).
+  */
+ #define SPK_APM_PORT          GPR_PORT_APM
+ #define SPK_PRM_PORT          2u        /* the PRM instance (Linux q6prm GPR_PRM_MODULE_IID) */
+@@ -1431,22 +1448,146 @@
+ #define SPK_TLMM_PA           0x0f100000u
+ #define SPK_TDM_GPIO0         122u
+ #define SPK_ANSWER_MS         1000u
++#define SPK_GRAPH_ANSWER_MS   3000u
+ #define SPK_HOLD_MS           2000u
++#define SPK_RUN_MS            26000u    /* 0277: 26 s, room for 15 s of play in pandora_amp_tdm */
++#define APM_CMD_GRAPH_OPEN    0x01001000u
++#define APM_CMD_GRAPH_PREPARE 0x01001001u
++#define APM_CMD_GRAPH_START   0x01001002u
++#define APM_CMD_GRAPH_STOP    0x01001003u
++#define APM_CMD_GRAPH_CLOSE   0x01001004u
++#define APM_CMD_SET_CFG       0x01001006u
++#define GPR_RSP_BASIC         0x02001005u   /* GPR_IBASIC_RSP_RESULT {opcode, status} */
++#define APM_MODULE_IID        1u
++#define APM_PARAM_SG_LIST     0x08001005u
++#define SPK_SHM_CMDS          0x40000u      /* command payloads below, the stream's buffers above */
+ 
+-enum {SpkOff, SpkWait, SpkMap, SpkUnmap, SpkClock, SpkHold, SpkRelease, SpkDone};
++enum {SpkOff, SpkWait, SpkMap, SpkUnmap, SpkClock, SpkHold, SpkRelease, SpkDone, SpkGraph, SpkRunning, SpkUnmapEnd,
++    SpkIdle};
+ 
+ static vm_offset_t ad_shm_va;            /* the DSP buffer (smmu_survey) */
+ static uint64_t ad_shm_pa, ad_shm_size;
+ static bool ad_smmu_audio;               /* the audio streams pass the apps SMMU */
+ 
++/* One APM command of the graph sequence: out of band (its payload at shm offset off) or in band. */
++struct spk_cmd {
++	const char *what;
++	uint32_t opcode, off, len;
++	bool oob, must;
++	uint8_t inband[56];
++};
++
+ static struct {
+ 	int level;
+ 	unsigned state;
+ 	uint8_t tx[128];
+ 	uint32_t tx_len, token, handle, others;
+-	uint64_t answer_by, hold_until, t0;
++	uint64_t answer_by, hold_until, t0, run_until;
++	struct spk_cmd cmds[16];
++	unsigned ncmd, icmd, failed;
++	bool opened, closing;
++	uint32_t cursor, nsg, sg[8];
+ } spk;
+ 
++/*
++ * 0271: a test tone into the running speaker graph, through its shared-memory endpoint (instance 0x4001,
++ * MODULE_ID_WR_SHARED_MEM_EP; spf wr_sh_mem_ep_api.h). 0272: DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2, as gsl writes
++ * (gsl_datapath.c); spk14's version-1 command came back with AR_EUNSUPPORTED (3) for every buffer. Payload
++ * {data address lsw, msw (the stream index in the upper word, as for the command payloads), mem map handle, size,
++ * timestamp lsw, msw, flags 0, metadata address lsw, msw, handle, size: all 0}, one per 20 ms buffer in the stream
++ * area above SPK_SHM_CMDS; DATA_CMD_RSP_WR_SH_MEM_EP_DATA_BUFFER_DONE_V2 {data address lsw, msw, handle, status,
++ * ...} hands it back and the next 20 ms go into it. 1 kHz on both channels, interleaved q31 as the endpoint's
++ * media format says; 0277: -12 dBFS steady (0275: -20 dBFS beeps; 0271: -30 dBFS steady; the user heard neither).
++ * Four in flight. Audible only while the amplifiers
++ * play (pandora_amp_tdm: PLAY ... PAUSE).
++ */
++#define SPK_TONE_MIID         0x4001u
++#define SPK_DATA_WRITE        0x0400100Au
++#define SPK_DATA_WRITE_DONE   0x05001004u
++#define SPK_TONE_FRAMES       960u                       /* 20 ms at 48 kHz */
++#define SPK_TONE_BYTES        (SPK_TONE_FRAMES * 2u * 4u)
++#define SPK_TONE_SLOT         0x2000u
++#define SPK_TONE_SLOTS        8u
++#define SPK_TONE_INFLIGHT     4u
++static const int32_t spk_sine[96] = {         /* one period of 500 Hz at 48 kHz, -12 dBFS q31 (0279; 1 kHz before) */
++	0, 35279985, 70408896, 105236305, 139613076, 173392003, 206428438, 238580915,
++	269711752, 299687642, 328380223, 355666630, 381430018, 405560063, 427953439, 448514252,
++	467154458, 483794237, 498362335, 510796368, 521043094, 529058633, 534808661, 538268557,
++	539423504, 538268557, 534808661, 529058633, 521043094, 510796368, 498362335, 483794237,
++	467154458, 448514252, 427953439, 405560063, 381430018, 355666630, 328380223, 299687642,
++	269711752, 238580915, 206428438, 173392003, 139613076, 105236305, 70408896, 35279985,
++	0, -35279985, -70408896, -105236305, -139613076, -173392003, -206428438, -238580915,
++	-269711752, -299687642, -328380223, -355666630, -381430018, -405560063, -427953439, -448514252,
++	-467154458, -483794237, -498362335, -510796368, -521043094, -529058633, -534808661, -538268557,
++	-539423504, -538268557, -534808661, -529058633, -521043094, -510796368, -498362335, -483794237,
++	-467154458, -448514252, -427953439, -405560063, -381430018, -355666630, -328380223, -299687642,
++	-269711752, -238580915, -206428438, -173392003, -139613076, -105236305, -70408896, -35279985,
++};
++/*
++ * 0279 (spk20: the speakers play; the user could not tell whether one or both): the bottom speaker 500 Hz, the top
++ * 1 kHz, at different times, by the time since the tone started (the amps play from about 1.8 s to 19.8 s). Left
++ * (TDM slot 0) is the top amp, right (slot 1) the bottom: the amps' receive slots 0x4820 (0x42 slot 0, 0x40 slot 1).
++ * Each piece faded in and out over 20 ms.
++ */
++static const struct {
++	uint32_t from_ms, to_ms;
++	bool bottom, top;
++} spk_plan[] = {{3000, 8000, true, false}, {9000, 14000, false, true}, {15000, 18000, true, true}};
++#define SPK_TONE_FADE         SPK_TONE_FRAMES
++
++static int32_t
++spk_tone_sample(uint64_t n, bool top)
++{
++	for (unsigned i = 0; i < sizeof(spk_plan) / sizeof(spk_plan[0]); i++) {
++		const uint64_t a = (uint64_t)spk_plan[i].from_ms * 48u, b = (uint64_t)spk_plan[i].to_ms * 48u;
++		if (n < a || n >= b || !(top ? spk_plan[i].top : spk_plan[i].bottom)) {
++			continue;
++		}
++		int64_t v = spk_sine[(top ? 2u * n : n) % 96u];
++		const uint64_t edge = n - a < b - 1u - n ? n - a : b - 1u - n;
++		if (edge < SPK_TONE_FADE) {
++			v = v * (int64_t)edge / (int64_t)SPK_TONE_FADE;
++		}
++		return (int32_t)v;
++	}
++	return 0;
++}
++static struct {
++	bool on;
++	uint32_t sent, done, bad, inflight, busy;
++	uint64_t frames;
++} spk_tone;
++/*
++ * 0295: boot-arg pandora_spk_live=1: the speaker graph runs on (no SPK_RUN_MS stop, no test tone) and its buffers
++ * carry iOS's output, pandora_audio_out_fill (PandoraAudio.cpp: the "Speaker" device's ring, silence while its IO is
++ * stopped); pandora_amp.c keeps the amps playing.
++ */
++static int spk_live;
++extern uint32_t pandora_audio_out_fill(int32_t *dst, uint32_t frames);
++
++/*
++ * 0300: with pandora_spk_live the graph follows the route: pandora_adsp_route (PandoraAudio.cpp) asks for the
++ * speaker's graph (spkgraph.bin), the receiver's (rcvgraph.bin, tools/spk_graph.py ACDB OUT receiver) or none. The
++ * instances the run-time settings go to come from the file's IIDS section (tagged modules, spk_graph.py); a file
++ * without it gets the speaker graph's.
++ * 0301: aud30 closed the graph when the route went to none, as PAL closes a stream's graph at its standby, and released
++ * the TDM clock: 60 ms later the DSP crashed, "systemcache.c:1048:F03C0C44: Island SCID 12 is not configured" (with no
++ * use case left it goes to its island low-power mode, which needs a system cache (LLCC) slice that Android's kernel
++ * configures and ours does not). So a graph always runs: none keeps the one there is (silence, the amps down), and a
++ * change of route closes the graph and opens the other with the clock held. Without a graph (SpkIdle) only after a
++ * failure; the next request tries again.
++ */
++enum {SpkNone = 0, SpkSpeaker = 1, SpkReceiver = 2};
++static volatile uint32_t spk_want = SpkSpeaker;   /* the graph asked for */
++static uint32_t spk_cur = SpkSpeaker;             /* the graph running, opening or closing */
++static volatile uint32_t spk_req, spk_done;       /* route requests, the last one dealt with */
++static uint32_t spk_doing;                        /* the request the change under way is for */
++static bool spk_amp_started;
++static bool spk_swap;                             /* 0301: closing for the other graph, the clock held */
++static struct {
++	uint32_t ch, sh_ep, dec, cnv, vol, spr, mfc, tdm;
++} spk_ii;
++
+ static void
+ spk_put32(uint8_t *p, uint32_t v)
+ {
+@@ -1535,6 +1676,371 @@
+ 	spk_clock(SPK_TDM_HZ);
+ }
+ 
++/* ---- level 3: the speaker graph (0262) ---- */
++extern uint8_t *pandora_fw_file(const char *name, uint32_t *size);   /* pandora_amp.c: a file of the pinned pack */
++extern void pandora_amp_tdm(void);                                    /* pandora_amp.c */
++
++static void
++spk_put16(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++}
++
++/* Into the DSP buffer's command area; the offset, ~0u when it does not fit. */
++static uint32_t
++spk_shm(const void *data, uint32_t len)
++{
++	const uint32_t off = spk.cursor;
++	if ((uint64_t)off + len > SPK_SHM_CMDS || (uint64_t)off + len > ad_shm_size) {
++		return ~0u;
++	}
++	memcpy((void *)(ad_shm_va + off), data, len);
++	spk.cursor = (off + len + 0xffu) & ~0xffu;
++	return off;
++}
++
++/* An apm_module_param_data_t {instance, parameter, size, error code 0} and its data, padded to 8; its length. */
++static uint32_t
++spk_param(uint8_t *b, uint32_t miid, uint32_t pid, const void *data, uint32_t n)
++{
++	const uint32_t len = (16u + n + 7u) & ~7u;
++	bzero(b, len);
++	spk_put32(b, miid);
++	spk_put32(b + 4, pid);
++	spk_put32(b + 8, n);
++	memcpy(b + 16, data, n);
++	return len;
++}
++
++static void
++spk_add_oob(const char *what, uint32_t opcode, const void *data, uint32_t len, bool must)
++{
++	const uint32_t off = spk_shm(data, len);
++	if (spk.ncmd >= 16 || off == ~0u) {
++		printf("PANDORA SPK: %s (%u bytes) does not fit\n", what, len);
++		spk.failed++;
++		return;
++	}
++	struct spk_cmd *c = &spk.cmds[spk.ncmd++];
++	c->what = what;
++	c->opcode = opcode;
++	c->off = off;
++	c->len = len;
++	c->oob = true;
++	c->must = must;
++}
++
++/* PREPARE, START, STOP, CLOSE: APM_PARAM_ID_SUB_GRAPH_LIST of the graph's subgraphs, in band. */
++static void
++spk_add_sgs(const char *what, uint32_t opcode, bool must)
++{
++	if (spk.ncmd >= 16) {
++		return;
++	}
++	uint8_t list[4 + 4 * 8];
++	spk_put32(list, spk.nsg);
++	for (unsigned i = 0; i < spk.nsg; i++) {
++		spk_put32(list + 4 + 4 * i, spk.sg[i]);
++	}
++	struct spk_cmd *c = &spk.cmds[spk.ncmd++];
++	c->what = what;
++	c->opcode = opcode;
++	c->oob = false;
++	c->must = must;
++	c->len = spk_param(c->inband, APM_MODULE_IID, APM_PARAM_SG_LIST, list, 4 + 4 * spk.nsg);
++}
++
++/* apm_cmd_header {payload address lsw, msw, mem map handle, payload size}: out of band the DSP buffer's address
++ * as it was mapped (the stream index in the upper word), in band the payload after it. */
++static void
++spk_cmd_send(void)
++{
++	const struct spk_cmd *c = &spk.cmds[spk.icmd];
++	uint8_t pl[16 + sizeof(c->inband)];
++	bzero(pl, sizeof(pl));
++	if (c->oob) {
++		const uint64_t a = ad_shm_pa + c->off;
++		spk_put32(pl, (uint32_t)a);
++		spk_put32(pl + 4, SPK_SID_INDEX | (uint32_t)(a >> 32));
++		spk_put32(pl + 8, spk.handle);
++	} else {
++		memcpy(pl + 16, c->inband, c->len);
++	}
++	spk_put32(pl + 12, c->len);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	spk_send(SPK_APM_PORT, c->opcode, pl, c->oob ? 16u : 16u + c->len, SpkGraph);
++	clock_interval_to_deadline(SPK_GRAPH_ANSWER_MS, NSEC_PER_MSEC, &spk.answer_by);
++}
++
++/* The PCM decoder's and converter's output (payload_pcm_output_format_cfg_t in a media_format_t). */
++static uint32_t
++spk_pcm_out(uint8_t *b, uint32_t miid)
++{
++	uint8_t d[30];
++	bzero(d, sizeof(d));
++	spk_put32(d, 1);                       /* DATA_FORMAT_FIXED_POINT */
++	spk_put32(d + 4, 0x09001000u);         /* MEDIA_FMT_ID_PCM */
++	spk_put32(d + 8, 18);
++	spk_put16(d + 12, 32);                 /* bit width */
++	spk_put16(d + 14, 1);                  /* PCM_LSB_ALIGNED */
++	spk_put16(d + 16, 32);                 /* bits per sample */
++	spk_put16(d + 18, 31);                 /* q factor */
++	spk_put16(d + 20, 1);                  /* PCM_LITTLE_ENDIAN */
++	spk_put16(d + 22, 3);                  /* PCM_DEINTERLEAVED_UNPACKED: playback */
++	spk_put16(d + 26, 2);                  /* channels */
++	d[28] = 1;                             /* PCM_CHANNEL_L */
++	d[29] = 2;                             /* PCM_CHANNEL_R */
++	return spk_param(b, miid, 0x08001008u, d, sizeof(d));
++}
++
++static void spk_graph_done(bool aborted);
++
++/* spkgraph.bin: "PSPKGR01", u32 sections, {u32 type, u32 bytes, data padded to 8}: 1 open, 2 calibration,
++ * 3 TDM tag data, 4 subgraphs (tools/spk_graph.py). */
++static void
++spk_graph_begin(void)
++{
++	uint32_t size = 0;
++	const char *file = spk_cur == SpkReceiver ? "rcvgraph.bin" : "spkgraph.bin";
++	uint8_t *f = pandora_fw_file(file, &size);
++	const uint8_t *sec[6] = {NULL};
++	uint32_t len[6] = {0};
++	spk.ncmd = spk.icmd = spk.failed = 0;
++	spk.cursor = 0;
++	spk.opened = spk.closing = false;
++	if (f && size >= 12 && memcmp(f, "PSPKGR01", 8) == 0) {
++		const uint32_t n = spk_le32(f + 8);
++		uint32_t o = 12;
++		for (uint32_t i = 0; i < n && o + 8 <= size; i++) {
++			const uint32_t t = spk_le32(f + o), b = spk_le32(f + o + 4);
++			if (o + 8 + b > size) {
++				break;
++			}
++			if (t >= 1 && t <= 5) {
++				sec[t] = f + o + 8;
++				len[t] = b;
++			}
++			o += 8 + ((b + 7u) & ~7u);
++		}
++	}
++	if (!sec[1] || !sec[3] || len[4] < 8 || spk_le32(sec[4]) == 0 || spk_le32(sec[4]) > 8) {
++		printf("PANDORA SPK: %s %s: no graph\n", file, f ? "incomplete" : "not in the pack");
++		if (f) {
++			kfree_data(f, (vm_size_t)size);
++		}
++		spk.closing = true;
++		spk_graph_done(true);
++		return;
++	}
++	spk.nsg = spk_le32(sec[4]);
++	for (unsigned i = 0; i < spk.nsg; i++) {
++		spk.sg[i] = spk_le32(sec[4] + 4 + 4 * i);
++	}
++	/* 0300: IIDS {u32 TDM channels, u32 count, <tag, instance>...}; the speaker graph's instances otherwise */
++	spk_ii.ch = 2;
++	spk_ii.sh_ep = 0x4001;
++	spk_ii.dec = 0x4003;
++	spk_ii.cnv = 0x4004;
++	spk_ii.vol = 0x401f;
++	spk_ii.spr = 0x4163;
++	spk_ii.mfc = 0x40b6;
++	spk_ii.tdm = 0x4023;
++	if (sec[5] && len[5] >= 8) {
++		const uint32_t ch = spk_le32(sec[5]), n = spk_le32(sec[5] + 4);
++		spk_ii.ch = ch == 1 ? 1 : 2;
++		for (uint32_t i = 0; i < n && 16 + 8 * i <= len[5]; i++) {
++			const uint32_t t = spk_le32(sec[5] + 8 + 8 * i), iid = spk_le32(sec[5] + 12 + 8 * i);
++			switch (t) {
++			case 0xc0000001: spk_ii.sh_ep = iid; break;
++			case 0xc000000e: spk_ii.dec = iid; break;
++			case 0xc0000010: spk_ii.cnv = iid; break;
++			case 0xc000000d: spk_ii.vol = iid; break;
++			case 0xc0000013: spk_ii.spr = iid; break;
++			case 0xc0000019: spk_ii.mfc = iid; break;
++			case 0xc0000004: spk_ii.tdm = iid; break;
++			default: break;
++			}
++		}
++	}
++	spk_add_oob("graph open", APM_CMD_GRAPH_OPEN, sec[1], len[1], true);
++	if (len[2]) {
++		spk_add_oob("calibration", APM_CMD_SET_CFG, sec[2], len[2], false);
++	}
++	uint8_t b[64], d[32];
++	/* the stream MFC (pspd_mfc): param_id_mfc_output_media_fmt_t {sample rate, bit width, channels, types}; the
++	 * device's channels (0300: the receiver's one is PCM_CHANNEL_C, as PAL maps one channel) */
++	bzero(d, sizeof(d));
++	spk_put32(d, 48000);
++	spk_put16(d + 4, 32);
++	spk_put16(d + 6, spk_ii.ch);
++	if (spk_ii.ch == 1) {
++		spk_put16(d + 8, 3);
++	} else {
++		spk_put16(d + 8, 1);
++		spk_put16(d + 10, 2);
++	}
++	spk_add_oob("stream MFC", APM_CMD_SET_CFG, b, spk_param(b, spk_ii.mfc, 0x08001024u, d, 8 + 2 * spk_ii.ch), false);
++	/* the shared-memory endpoint (sh_ep): PARAM_ID_MEDIA_FORMAT, payload_media_fmt_pcm_t */
++	bzero(d, sizeof(d));
++	spk_put32(d, 1);
++	spk_put32(d + 4, 0x09001000u);
++	spk_put32(d + 8, 18);
++	spk_put32(d + 12, 48000);
++	spk_put16(d + 16, 32);                 /* bit width */
++	d[18] = 1;                             /* PCM_LSB_ALIGNED; interleaved left 0, as AGM leaves it */
++	spk_put16(d + 20, 32);                 /* bits per sample */
++	spk_put16(d + 22, 31);                 /* q factor */
++	spk_put16(d + 24, 1);                  /* PCM_LITTLE_ENDIAN */
++	spk_put16(d + 26, 2);
++	d[28] = 1;
++	d[29] = 2;
++	spk_add_oob("stream media format", APM_CMD_SET_CFG, b, spk_param(b, spk_ii.sh_ep, 0x0800100Cu, d, 30), false);
++	/* the TDM endpoint's media format: param_id_hw_ep_mf_t */
++	bzero(d, sizeof(d));
++	spk_put32(d, 48000);
++	spk_put16(d + 4, 32);
++	spk_put16(d + 6, spk_ii.ch);
++	spk_put32(d + 8, 1);
++	spk_add_oob("TDM media format", APM_CMD_SET_CFG, b, spk_param(b, spk_ii.tdm, 0x08001017u, d, 12), false);
++	/* 0304: the backend's LPAIF type and interface index in PARAM_ID_TDM_INTF_CFG, as AGM's configure_tdm_ep fills
++	 * them for TDM-LPAIF-RX-PRIMARY (LPAIF 0, primary 0): the ACDB's values are placeholders. The speaker's tag data
++	 * holds 0 and 0 already; the receiver's holds interface 1 (aud33: no sound, the samples went to the secondary
++	 * TDM, which no amp listens to). */
++	{
++		uint8_t *t = (uint8_t *)(uintptr_t)sec[3];
++		for (uint32_t o = 0; o + 16 <= len[3];) {
++			const uint32_t pid = spk_le32(t + o + 4), n = spk_le32(t + o + 8);
++			if (pid == 0x0800101Bu && n >= 8 && o + 16 + n <= len[3]) {
++				if (spk_le32(t + o + 16) != 0 || spk_le32(t + o + 20) != 0) {
++					printf("PANDORA SPK: TDM interface: LPAIF %u interface %u in the ACDB, primary TDM set\n",
++					    spk_le32(t + o + 16), spk_le32(t + o + 20));
++				}
++				spk_put32(t + o + 16, 0);
++				spk_put32(t + o + 20, 0);
++			}
++			o += 16 + ((n + 7u) & ~7u);
++		}
++	}
++	spk_add_oob("TDM interface", APM_CMD_SET_CFG, sec[3], len[3], false);
++	spk_add_oob("PCM decoder output", APM_CMD_SET_CFG, b, spk_pcm_out(b, spk_ii.dec), false);
++	spk_add_oob("PCM converter output", APM_CMD_SET_CFG, b, spk_pcm_out(b, spk_ii.cnv), false);
++	spk_put32(d, spk_ii.tdm);              /* param_id_spr_delay_path_end_t: the TDM endpoint */
++	spk_add_oob("SPR path end", APM_CMD_SET_CFG, b, spk_param(b, spk_ii.spr, 0x080010C4u, d, 4), false);
++	spk_put32(d, 1);                       /* SPR_SESSION_TIME_SKIP_RESET_GAPLESS_SWITCH */
++	spk_add_oob("SPR session time reset", APM_CMD_SET_CFG, b, spk_param(b, spk_ii.spr, 0x08001B07u, d, 4), false);
++	{
++		/* 0276: unity gain and unmute on the stream's volume control (0x401f, MODULE_ID_VOL_CTRL;
++		 * PARAM_ID_VOL_CTRL_MASTER_GAIN 0x08001035 {u16 gain Q13, u16 0}, _MUTE 0x08001036 {u32 0}) and unmute on
++		 * the device volume control (0x437e, calibrated to 0x2000), as Linux q6apm's VOL_CTRL_DEFAULT_GAIN.
++		 * spk17b: the tone went in (buffers consumed) but the amps read AUDIO_IN_MAX 0. 0x401f's calibration is
++		 * the ACDB's Volume table (spkgraph.bin): Level_15, which the graph had until aud25, mutes it and gives
++		 * its channels 0x00170894 (Q28, -45 dB) in 0x08001038, which this does not touch; Level_0 has no mute
++		 * and 0x10000000 (0 dB) there. */
++		uint8_t v[96], g[4] = {0x00, 0x20, 0, 0}, m[4] = {0, 0, 0, 0};
++		uint32_t vl = spk_param(v, spk_ii.vol, 0x08001035u, g, 4);
++		vl += spk_param(v + vl, spk_ii.vol, 0x08001036u, m, 4);
++		if (spk_cur != SpkReceiver) {
++			vl += spk_param(v + vl, 0x437e, 0x08001036u, m, 4);   /* the speaker's device volume control */
++		}
++		spk_add_oob("volume", APM_CMD_SET_CFG, v, vl, false);
++	}
++	spk_add_sgs("graph prepare", APM_CMD_GRAPH_PREPARE, true);
++	spk_add_sgs("graph start", APM_CMD_GRAPH_START, true);
++	kfree_data(f, (vm_size_t)size);
++	printf("PANDORA SPK: %s graph: %u subgraphs, open %u bytes, calibration %u, TDM %u (%u channels, endpoint %#x); "
++	    "%u commands\n", spk_cur == SpkReceiver ? "receiver" : "speaker", spk.nsg, len[1], len[2], len[3], spk_ii.ch,
++	    spk_ii.tdm, spk.ncmd);
++	spk_cmd_send();
++}
++
++/* STOP (when it started) and CLOSE. */
++static void
++spk_graph_end(bool started)
++{
++	spk.ncmd = spk.icmd = 0;
++	spk.closing = true;
++	if (started) {
++		spk_add_sgs("graph stop", APM_CMD_GRAPH_STOP, false);
++	}
++	spk_add_sgs("graph close", APM_CMD_GRAPH_CLOSE, false);
++	spk_cmd_send();
++}
++
++/* The sequence ended: started (running), or aborted (close what was opened), or closed (release the clock). */
++static void
++spk_graph_done(bool aborted)
++{
++	if (spk.closing && spk_swap && spk_live && spk.handle && spk_want != SpkNone) {
++		spk_swap = false;                     /* 0301: straight to the other graph, the clock held */
++		spk_cur = spk_want;
++		spk_graph_begin();
++	} else if (spk.closing) {
++		spk_swap = false;
++		spk_clock(0);
++	} else if (!aborted) {
++		printf("PANDORA SPK: %s graph running after %llu ms, %u commands refused\n",
++		    spk_cur == SpkReceiver ? "receiver" : "speaker", ad_ms(spk.t0), spk.failed);
++		spk.state = SpkRunning;
++		clock_interval_to_deadline(SPK_RUN_MS, NSEC_PER_MSEC, &spk.run_until);
++		if (spk_live) {
++			spk.run_until = ~0ull;
++			__atomic_store_n(&spk_done, spk_doing, __ATOMIC_RELEASE);
++			thread_wakeup((event_t)&spk_done);
++		}
++		bzero(&spk_tone, sizeof(spk_tone));
++		spk_tone.on = true;                   /* 0271: the test tone, from now until the graph stops */
++		if (!spk_amp_started) {
++			spk_amp_started = true;           /* 0300: the amps' first play, once */
++			pandora_amp_tdm();
++		}
++	} else if (spk.opened) {
++		spk_graph_end(false);
++	} else {
++		spk.closing = true;
++		spk_clock(0);
++	}
++}
++
++/* An answer (or none) to the current graph command. */
++static void
++spk_graph_answer(bool answered, uint32_t opcode, uint32_t cmd, uint32_t status)
++{
++	const struct spk_cmd *c = &spk.cmds[spk.icmd];
++	const bool ok = answered && opcode == GPR_RSP_BASIC && cmd == c->opcode && status == 0;
++	if (answered) {
++		printf("PANDORA SPK: %s: answer %#x for %#x, status %#x (%llu ms)\n", c->what, opcode, cmd, status,
++		    ad_ms(spk.t0));
++	} else {
++		printf("PANDORA SPK: %s: no answer\n", c->what);
++	}
++	if (c->opcode == APM_CMD_GRAPH_OPEN && ok) {
++		spk.opened = true;
++	}
++	if (!ok) {
++		spk.failed++;
++	}
++	if (!ok && c->must && !spk.closing) {
++		spk_graph_done(true);
++	} else if (spk.icmd + 1 >= spk.ncmd) {
++		spk_graph_done(false);
++	} else {
++		spk.icmd++;
++		spk_cmd_send();
++	}
++}
++
++/* 0300: no graph and no clock: the route's request (if any) is done. */
++static void
++spk_idle(void)
++{
++	spk.state = SpkIdle;
++	spk_cur = SpkNone;
++	__atomic_store_n(&spk_done, spk_doing, __ATOMIC_RELEASE);
++	thread_wakeup((event_t)&spk_done);
++	printf("PANDORA SPK: no graph (%llu ms)\n", ad_ms(spk.t0));
++}
++
+ static void
+ spk_receive(const uint8_t *data, uint32_t len)
+ {
+@@ -1544,6 +2050,28 @@
+ 	}
+ 	const uint32_t w0 = p.payload_bytes >= 4 ? spk_le32(p.payload) : 0;
+ 	const uint32_t w1 = p.payload_bytes >= 8 ? spk_le32(p.payload + 4) : 0;
++	if (p.opcode == GPR_RSP_BASIC && w0 == SPK_DATA_WRITE) {     /* a tone buffer refused (0272) */
++		spk_tone.bad++;
++		if (spk_tone.inflight) {
++			spk_tone.inflight--;
++		}
++		if (spk_tone.bad <= 3) {
++			printf("PANDORA SPK: tone buffer refused by port %#x: status %#x\n", p.src_port, w1);
++		}
++		return;
++	}
++	if (p.opcode == SPK_DATA_WRITE_DONE) {         /* a tone buffer back (0271): its status is the fourth word */
++		const uint32_t status = p.payload_bytes >= 16 ? spk_le32(p.payload + 12) : ~0u;
++		spk_tone.done++;
++		spk_tone.bad += status != 0;
++		if (spk_tone.inflight) {
++			spk_tone.inflight--;
++		}
++		if (status != 0 && spk_tone.bad <= 3) {
++			printf("PANDORA SPK: tone buffer %#x returned with status %#x\n", w0, status);
++		}
++		return;
++	}
+ 	if (spk.state == SpkOff || spk.state == SpkDone || p.token != 0x5300u + spk.token) {
+ 		if (spk.others++ < 8) {
+ 			printf("PANDORA SPK: GPR in: opcode %#x token %#x from port %#x, %u bytes, words %#x %#x\n", p.opcode,
+@@ -1558,6 +2086,10 @@
+ 			spk.handle = w0;
+ 			printf("PANDORA SPK: the APM mapped %#llx + %#llx (address word %#x) as handle %#x after %llu ms\n",
+ 			    ad_shm_pa, ad_shm_size, SPK_SID_INDEX, spk.handle, ad_ms(spk.t0));
++			if (spk.level >= 3) {
++				spk_level2();                  /* kept mapped for the graph */
++				break;
++			}
+ 			uint8_t pl[4];
+ 			spk_put32(pl, spk.handle);
+ 			spk_send(SPK_APM_PORT, APM_CMD_MEM_UNMAP, pl, 4, SpkUnmap);
+@@ -1573,15 +2105,35 @@
+ 	case SpkClock:
+ 		printf("PANDORA SPK: PRM clock request (%u Hz, attribute %u) answer opcode %#x: command %#x status %#x\n",
+ 		    SPK_TDM_HZ, PRM_CLK_ATTR, p.opcode, w0, w1);
+-		if (p.opcode == PRM_RSP_REQUEST && w1 == 0) {
++		if (p.opcode == PRM_RSP_REQUEST && w1 == 0 && spk.level >= 3 && spk.handle) {
++			spk_graph_begin();
++		} else if (p.opcode == PRM_RSP_REQUEST && w1 == 0) {
+ 			spk.state = SpkHold;
+ 			clock_interval_to_deadline(SPK_HOLD_MS, NSEC_PER_MSEC, &spk.hold_until);
++		} else if (spk_live && spk.handle) {
++			spk_idle();                        /* 0300: no clock, no graph; the next request tries again */
+ 		} else {
+ 			spk.state = SpkDone;
+ 		}
+ 		break;
+ 	case SpkRelease:
+ 		printf("PANDORA SPK: PRM clock release answer opcode %#x: command %#x status %#x\n", p.opcode, w0, w1);
++		if (spk_live && spk.level >= 3 && spk.handle) {
++			spk_idle();                        /* 0300: the map stays for the next graph */
++		} else if (spk.level >= 3 && spk.handle) {
++			uint8_t pl[4];
++			spk_put32(pl, spk.handle);
++			spk_send(SPK_APM_PORT, APM_CMD_MEM_UNMAP, pl, 4, SpkUnmapEnd);
++		} else {
++			spk.state = SpkDone;
++		}
++		break;
++	case SpkGraph:
++		spk_graph_answer(true, p.opcode, w0, w1);
++		break;
++	case SpkUnmapEnd:
++		printf("PANDORA SPK: unmap answer opcode %#x: command %#x status %#x; done\n", p.opcode, w0, w1);
++		spk.handle = 0;
+ 		spk.state = SpkDone;
+ 		break;
+ 	default:
+@@ -1589,6 +2141,58 @@
+ 	}
+ }
+ 
++/* Tone buffers into the endpoint while the graph runs and no graph command is waiting to go out (0271). */
++static void
++spk_tone_pump(void)
++{
++	while (spk_tone.on && spk.state == SpkRunning && !spk.tx_len && spk_tone.inflight < SPK_TONE_INFLIGHT) {
++		const uint32_t off = SPK_SHM_CMDS + (spk_tone.sent % SPK_TONE_SLOTS) * SPK_TONE_SLOT;
++		if ((uint64_t)off + SPK_TONE_BYTES > ad_shm_size) {
++			spk_tone.on = false;
++			break;
++		}
++		int32_t *s = (int32_t *)(ad_shm_va + off);
++		if (spk_live) {
++			(void)pandora_audio_out_fill(s, SPK_TONE_FRAMES);
++		} else {
++			for (uint32_t f = 0; f < SPK_TONE_FRAMES; f++) {
++				const uint64_t n = spk_tone.frames + f;
++				s[2 * f] = spk_tone_sample(n, true);
++				s[2 * f + 1] = spk_tone_sample(n, false);
++			}
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		const uint64_t a = ad_shm_pa + off;
++		uint8_t pl[44], tx[GPR_HEADER_BYTES + 44];      /* 0273: the GPR header is 24 bytes (spk15: 64 was short) */
++		bzero(pl, sizeof(pl));
++		spk_put32(pl, (uint32_t)a);
++		spk_put32(pl + 4, SPK_SID_INDEX | (uint32_t)(a >> 32));
++		spk_put32(pl + 8, spk.handle);
++		spk_put32(pl + 12, SPK_TONE_BYTES);
++		GprPacket p;
++		bzero(&p, sizeof(p));
++		p.dst_domain = GPR_DOMAIN_ADSP;
++		p.src_domain = GPR_DOMAIN_APPS;
++		p.src_port = SPK_APM_PORT;
++		p.dst_port = spk_ii.sh_ep;
++		p.token = 0x5400u + (spk_tone.sent & 0xffu);
++		p.opcode = SPK_DATA_WRITE;
++		const uint32_t n = gpr_encode(tx, sizeof(tx), &p, pl, sizeof(pl));
++		if (!n) {
++			printf("PANDORA SPK: tone: the data command does not encode; tone off\n");
++			spk_tone.on = false;
++			break;
++		}
++		if (qcom_glink_send(&ed_adsp.gl, ad_gpr, tx, n) != QcomGlinkOk) {
++			spk_tone.busy++;
++			break;
++		}
++		spk_tone.frames += SPK_TONE_FRAMES;
++		spk_tone.sent++;
++		spk_tone.inflight++;
++	}
++}
++
+ static void
+ spk_step(void)
+ {
+@@ -1623,11 +2227,49 @@
+ 	if (spk.state == SpkHold && now >= spk.hold_until) {
+ 		spk_clock(0);
+ 	}
++	if (spk.state == SpkRunning && now >= spk.run_until) {
++		spk_tone.on = false;
++		printf("PANDORA SPK: %u ms up: stopping the speaker graph; tone: %u buffers sent, %u back (%u with an error), "
++		    "%u in flight, sends refused %u\n", SPK_RUN_MS, spk_tone.sent, spk_tone.done, spk_tone.bad, spk_tone.inflight,
++		    spk_tone.busy);
++		spk_graph_end(true);
++	}
++	/* 0300: the route's graph (spk_want, pandora_adsp_route): close the one that runs, open the one asked for */
++	if (spk_live && !spk.tx_len && (spk.state == SpkRunning || spk.state == SpkIdle)) {
++		const uint32_t req = __atomic_load_n(&spk_req, __ATOMIC_ACQUIRE);
++		const uint32_t want = spk_want;
++		const bool fresh = __atomic_load_n(&spk_done, __ATOMIC_ACQUIRE) != req;
++		if (spk.state == SpkRunning && want != SpkNone && want != spk_cur) {
++			spk_doing = req;
++			spk_tone.on = false;
++			spk_swap = true;
++			printf("PANDORA SPK: closing the %s graph for the %s's\n", spk_cur == SpkReceiver ? "receiver" : "speaker",
++			    want == SpkReceiver ? "receiver" : "speaker");
++			spk_graph_end(true);
++		} else if (spk.state == SpkIdle && want != SpkNone && fresh) {
++			spk_doing = req;
++			spk_cur = want;
++			spk.t0 = now;
++			spk_clock(SPK_TDM_HZ);
++		} else if (fresh) {
++			__atomic_store_n(&spk_done, req, __ATOMIC_RELEASE);      /* already as asked (none: the graph stays) */
++			thread_wakeup((event_t)&spk_done);
++		}
++	}
++	spk_tone_pump();
++	static uint64_t live_log;
++	if (spk_live && spk.state == SpkRunning && now >= live_log) {
++		clock_interval_to_deadline(10000, NSEC_PER_MSEC, &live_log);
++		printf("PANDORA SPK: live at %llu ms: %u buffers sent, %u back (%u with an error), %u in flight, sends refused "
++		    "%u\n", ad_ms(spk.t0), spk_tone.sent, spk_tone.done, spk_tone.bad, spk_tone.inflight, spk_tone.busy);
++	}
+ 	if (spk.answer_by && now >= spk.answer_by) {
+ 		spk.answer_by = 0;
+ 		spk.tx_len = 0;
+ 		printf("PANDORA SPK: no answer in state %u\n", spk.state);
+-		if (spk.state == SpkMap || spk.state == SpkUnmap) {
++		if (spk.state == SpkGraph) {
++			spk_graph_answer(false, 0, 0, 0);
++		} else if (spk.state == SpkMap || spk.state == SpkUnmap) {
+ 			spk_level2();
+ 		} else if (spk.state == SpkClock) {
+ 			spk_clock(0);                          /* in case it was taken */
+@@ -1640,6 +2282,44 @@
+ 	}
+ }
+ 
++/*
++ * 0300: from PandoraAudio.cpp: the graph the route needs, 0 none, 1 the speaker's, 2 the receiver's; waits up to
++ * WAIT_MS for it to run (or for no graph). 0 when it is as asked, ENODEV without live graphs, ETIMEDOUT, EIO.
++ */
++int pandora_adsp_route(unsigned which, unsigned wait_ms);
++int
++pandora_adsp_route(unsigned which, unsigned wait_ms)
++{
++	if (!spk_live || spk.level < 3) {
++		return ENODEV;
++	}
++	spk_want = which <= SpkReceiver ? which : SpkNone;
++	const uint32_t req = __atomic_add_fetch(&spk_req, 1, __ATOMIC_ACQ_REL);
++	__atomic_store_n(&ad_irq_pending, 1, __ATOMIC_RELEASE);
++	thread_wakeup((event_t)&ad_irq_pending);
++	if (!wait_ms) {
++		return 0;
++	}
++	uint64_t deadline;
++	clock_interval_to_deadline(wait_ms, NSEC_PER_MSEC, &deadline);
++	for (;;) {
++		(void)assert_wait_deadline((event_t)&spk_done, THREAD_UNINT, deadline);
++		if ((int32_t)(__atomic_load_n(&spk_done, __ATOMIC_ACQUIRE) - req) >= 0) {
++			clear_wait(current_thread(), THREAD_AWAKENED);
++			break;
++		}
++		if (thread_block(THREAD_CONTINUE_NULL) == THREAD_TIMED_OUT) {
++			if ((int32_t)(__atomic_load_n(&spk_done, __ATOMIC_ACQUIRE) - req) >= 0) {
++				break;
++			}
++			printf("PANDORA SPK: route %u not ready after %u ms (state %u)\n", which, wait_ms, spk.state);
++			return ETIMEDOUT;
++		}
++	}
++	const bool ok = which == SpkNone || (spk.state == SpkRunning && spk_cur == which);
++	return ok ? 0 : EIO;
++}
++
+ /* ---- the battery: the SOCCP's side of Xiaomi's battery manager over PMIC GLINK --------- */
+ 
+ /*
+@@ -1652,10 +2332,10 @@
+  * notification {header, number, 256 bytes}. bat2 asked with the classic 24-byte opcode 0x30 reads:
+  * each came back as a 280-byte answer the old code did not take. The properties are the 4-byte ones
+  * mca_qcom_subpmic_proxy reads. The percentage is not among them: Android reads the bq27z561 gauge on
+- * the shared I2C bus (DT i2c@a94000) itself. Until the units are settled against Android's readings
+- * and the gauge is read, the values are only logged, not handed to the battery service: a pass after
+- * the channel comes up, then every 20 s and after each notification. Only reads go out; charging
+- * stays the SOCCP's.
++ * the shared I2C bus (DT i2c@a94000) itself, and so do we (pandora_amp.c). Until the units are
++ * settled against Android's readings, only bus_volt goes to the battery service (charger connected);
++ * the rest are logged: a pass after the channel comes up, then every 20 s and after each notification.
++ * Only reads go out; charging stays the SOCCP's.
+  */
+ #define BM_OWNER         0x800au
+ #define BM_TYPE_REQUEST  1u
+@@ -1691,6 +2371,7 @@
+ 	bool reading;                          /* a pass is under way */
+ 	uint64_t answer_by, refresh_at, open_by;
+ 	int32_t value[BM_PROPS];
++	bool ok[BM_PROPS];                     /* value answered without error in this pass */
+ 	uint32_t passes, answers, timeouts, notes, others;
+ 	char line[640];
+ } bm;
+@@ -1698,6 +2379,43 @@
+ LCK_GRP_DECLARE(ad_batt_grp, "pandora_battery");
+ LCK_MTX_DECLARE(ad_batt_lock, &ad_batt_grp);
+ static struct pandora_battery ad_batt;   /* what pandora_battery_get hands out (nothing valid yet) */
++#define BM_BUS_VOLT      0x20002u        /* bus_volt, µV (spk1: about 5 000 000 on the PC's USB) */
++#define AD_ONLINE_FRESH_MS 60000u
++#define AD_BUS_ON_UV     4000000         /* spk6: unplugged 26 000-38 000, plugged 4 708 000-5 013 000 */
++#define AD_NOTE_FIRST_MS 5000u           /* a pass's bus_volt does not overrule a notification this young */
++#define BM_NOTE_ONLINE   0u              /* notification 0: USB online in payload word 0 (battui2 §1.2) */
++static int ad_online = -1;               /* charger plugged 1, not 0, -1 unknown */
++static uint64_t ad_online_at, ad_note_at;   /* when ad_online was set; when a notification set it */
++
++/*
++ * The charger plugged or not: from the SOCCP's notification 0 (Android's usb/online: qcom_subpmic_notify_cb
++ * id 0 -> qcom_subpmic_update_usb_online, battui2 §1.2-1.4) or, between notifications, a pass's bus_volt.
++ * A change tells the battery service at once and has the gauge read again for the new current.
++ */
++static void
++ad_set_online(int online, bool note, const char *why)
++{
++	const uint64_t now = mach_absolute_time();
++	lck_mtx_lock(&ad_batt_lock);
++	if (!note && ad_note_at && ad_ms(ad_note_at) < AD_NOTE_FIRST_MS) {
++		lck_mtx_unlock(&ad_batt_lock);
++		return;
++	}
++	const int was = ad_online;
++	ad_online = online;
++	ad_online_at = now;
++	if (note) {
++		ad_note_at = now;
++	}
++	lck_mtx_unlock(&ad_batt_lock);
++	if (was != online) {
++		printf("PANDORA SOCCP: charger %s (%s)\n", online ? "plugged" : "unplugged", why);
++		if (was >= 0) {
++			pandora_battery_changed();
++			pandora_gauge_kick();
++		}
++	}
++}
+ 
+ static void
+ bm_state(void *ctx, QcomGlinkChannel *ch, int up)
+@@ -1775,6 +2493,9 @@
+ 			printf("PANDORA SOCCP: notification opcode %#x number %#x first word %#x (%u bytes)\n", op, bm_le32(m + 12),
+ 			    len >= 20 ? bm_le32(m + 16) : 0, len);
+ 		}
++		if (bm_le32(m + 12) == BM_NOTE_ONLINE && len >= 20) {
++			ad_set_online(bm_le32(m + 16) != 0, true, "notification");
++		}
+ 		bm.refresh_at = mach_absolute_time();  /* something changed: read again now */
+ 		return;
+ 	}
+@@ -1792,6 +2513,7 @@
+ 	char one[48];
+ 	bm.answers++;
+ 	bm.value[bm.step] = value;
++	bm.ok[bm.step] = result == 0;
+ 	if (result) {
+ 		snprintf(one, sizeof(one), " %s=err%#x", bm_props[bm.step].name, result);
+ 	} else {
+@@ -1838,6 +2560,7 @@
+ 	if (bm.answer_by && now >= bm.answer_by) {
+ 		char one[40];
+ 		bm.timeouts++;
++		bm.ok[bm.step] = false;
+ 		snprintf(one, sizeof(one), " %s=?", bm_props[bm.step].name);
+ 		strlcat(bm.line, one, sizeof(bm.line));
+ 		bm.pending = bm.inflight = false;
+@@ -1849,6 +2572,13 @@
+ 		bm.passes++;
+ 		printf("PANDORA SOCCP: MCA pass %u at %llu ms:%s (answers %u, timeouts %u)\n", bm.passes, ad_ms(ed_soccp.t0),
+ 		    bm.line, bm.answers, bm.timeouts);
++		for (unsigned i = 0; i < BM_PROPS; i++) {
++			if (bm_props[i].prop == BM_BUS_VOLT && bm.ok[i]) {
++				char why[32];
++				snprintf(why, sizeof(why), "bus %d uV", bm.value[i]);
++				ad_set_online(bm.value[i] > AD_BUS_ON_UV, false, why);
++			}
++		}
+ 		clock_interval_to_deadline(BM_REFRESH_MS, NSEC_PER_MSEC, &bm.refresh_at);
+ 	}
+ 	if (!bm.reading && bm.refresh_at && now >= bm.refresh_at) {
+@@ -1862,16 +2592,72 @@
+ 	}
+ }
+ 
+-/* For iokit/Kernel/arm/SweetBattery.cpp: the latest readings; false when there are none to use. */
++/*
++ * For iokit/Kernel/arm/SweetBattery.cpp: the latest readings; false when there are none to use.
++ * The battery itself is the bq27z561 gauge's (bsd/dev/pandora_amp.c, pandora_gauge=3): voltage,
++ * current (positive while charging), temperature, the mAh figures and cycles; the percentage as
++ * ad_display_percent. Android's battery psy (mca_business_battery batt_psy_get_prop, battui RESULT
++ * §3.1, §5): not online is discharging; online with the percentage at 100 and charging done
++ * (BatteryStatus FC, bit 5) is full; otherwise charging. Temperature is 0x06 in 0.1 K less 2730.
++ * Online is ad_set_online's (the SOCCP's, pandora_battery=1) while it is under a minute old, without
++ * it charge current.
++ */
++#define AD_SOC_PROPORTION_C 97           /* DT soc-proportion-c = <0x61>, pandora-live.dts 41344 */
++
++/*
++ * The percentage Android shows (mca_strategy_fg_comp fg_ui_soc_smooth, the path at 0x916c that
++ * non-EU models take charging or not: the EU switch [+0xad8] is set by event 0x3a, "is_eu_model";
++ * battui2 §3.3-3.5): remaining over full charge in 0.01 %, 97 % of it stretched to 100 %. Android
++ * computes it every 5 s (fg_update_status) and then moves what it shows towards it a point at a time;
++ * that step timing is not taken over yet.
++ */
++static int
++ad_display_percent(const struct pandora_gauge *g)
++{
++	if (g->full_mah <= 0 || g->remaining_mah < 0) {
++		return g->soc < 0 ? 0 : g->soc > 100 ? 100 : g->soc;
++	}
++	const int64_t r = 10000LL * g->remaining_mah / g->full_mah;
++	if (r <= 0) {
++		return 0;
++	}
++	if (r > AD_SOC_PROPORTION_C * 100) {
++		return 100;
++	}
++	int64_t s = 10000LL * (r + 100) / (AD_SOC_PROPORTION_C * 100 + 100);
++	return (int)(s > 10000 ? 100 : s / 100);
++}
++
+ bool
+ pandora_battery_get(struct pandora_battery *b, size_t size)
+ {
+ 	if (size != sizeof(*b)) {
+ 		return false;
+ 	}
++	struct pandora_gauge g;
++	const bool gauge = pandora_gauge_get(&g, sizeof(g));
+ 	lck_mtx_lock(&ad_batt_lock);
+ 	*b = ad_batt;
++	const int online = ad_online;
++	const uint64_t online_at = ad_online_at;
+ 	lck_mtx_unlock(&ad_batt_lock);
++	if (gauge) {
++		b->valid = b->present = 1;
++		b->percent = ad_display_percent(&g);
++		b->voltage_mv = g.voltage_mv;
++		b->current_ma = g.current_ma;
++		b->temperature = (g.temperature_dk - 2730) * 10;
++		b->temperature_ok = g.temperature_dk > 2330 && g.temperature_dk < 3730;   /* -40 to 100 degrees */
++		b->raw_mah = g.remaining_mah;
++		b->full_mah = g.full_mah;
++		b->design_mah = g.design_mah;
++		b->cycles = g.cycles;
++		const bool known = online >= 0 && online_at && ad_ms(online_at) < AD_ONLINE_FRESH_MS;
++		b->external = known ? online : g.current_ma > 0;
++		b->fully_charged = b->external && b->percent == 100 && (g.status & 0x20) != 0;
++		b->charging = b->external && !b->fully_charged;
++		b->time_to_full_min = b->time_to_empty_min = -1;
++	}
+ 	return b->valid != 0;
+ }
+ 
+@@ -2222,6 +3008,7 @@
+ 	(void)PE_parse_boot_argn("pandora_battery", &battery, sizeof(battery));
+ 	(void)PE_parse_boot_argn("pandora_battery_delay", &bdelay_s, sizeof(bdelay_s));
+ 	(void)PE_parse_boot_argn("pandora_spk", &spk.level, sizeof(spk.level));
++	(void)PE_parse_boot_argn("pandora_spk_live", &spk_live, sizeof(spk_live));
+ 	if (mode < 2) {
+ 		spk.level = 0;                     /* the speakers need the DSP */
+ 	}
+--- a/bsd/dev/pandora_gpi.c
++++ b/bsd/dev/pandora_gpi.c
+@@ -162,8 +162,10 @@
+ 		int result = -1;
+ 		while (g->ev_rp != hw) {
+ 			const PgpiEvent e = pgpi_event((const uint32_t *)(g->mem + EV_RING + g->ev_rp));
+-			printf("PANDORA GPI: event type %#x channel %u code %u status %#x length %u tre %#llx\n", e.type, e.chid,
+-			    e.code, e.status, e.length, e.tre);
++			if (!g->quiet || e.type != PGPI_EV_XFER_DONE || e.code == PGPI_CODE_ERROR) {
++				printf("PANDORA GPI: event type %#x channel %u code %u status %#x length %u tre %#llx\n", e.type,
++				    e.chid, e.code, e.status, e.length, e.tre);
++			}
+ 			if (e.type == PGPI_EV_XFER_DONE && e.chid == chid && result < 0) {
+ 				result = e.code == PGPI_CODE_ERROR ? EIO : 0;
+ 				*len = e.length;
+@@ -188,30 +190,43 @@
+ pandora_gpi_open(PandoraGpi *g, uint64_t block_pa, uint32_t block_len, uint32_t ee_offset, uint32_t gpii,
+     uint32_t seid, uint32_t proto)
+ {
++	const vm_offset_t regs = g->regs, mem = g->mem;
++	const uint64_t mem_pa = g->mem_pa;
++	const bool quiet = g->quiet;
+ 	bzero(g, sizeof(*g));
+ 	g->ee_offset = ee_offset;
+ 	g->gpii = gpii;
+ 	g->seid = seid;
+ 	g->proto = proto;
+-	g->regs = ml_io_map_unmappable((vm_offset_t)block_pa, block_len, VM_WIMG_IO);
++	g->quiet = quiet;
++	g->regs = regs ? regs : ml_io_map_unmappable((vm_offset_t)block_pa, block_len, VM_WIMG_IO);
+ 	if (!g->regs) {
+ 		return ENOMEM;
+ 	}
++	g->mem = mem;
++	g->mem_pa = mem_pa;
+ 	const uint32_t n = gpii;
+-	printf("PANDORA GPI: gpii %u before: tx %#x rx %#x event %#x, type irq %#x, masks %#x/%#x/%#x\n", n,
+-	    rd(g, CH_CNTXT(n, 0)), rd(g, CH_CNTXT(n, 1)), rd(g, EV_CNTXT(n)), rd(g, TYPE_IRQ(n)), rd(g, TYPE_IRQ_MSK(n)),
+-	    rd(g, SRC_CH_IRQ_MSK(n)), rd(g, IEOB_IRQ_MSK(n)));
++	if (!quiet) {
++		printf("PANDORA GPI: gpii %u before: tx %#x rx %#x event %#x, type irq %#x, masks %#x/%#x/%#x\n", n,
++		    rd(g, CH_CNTXT(n, 0)), rd(g, CH_CNTXT(n, 1)), rd(g, EV_CNTXT(n)), rd(g, TYPE_IRQ(n)),
++		    rd(g, TYPE_IRQ_MSK(n)), rd(g, SRC_CH_IRQ_MSK(n)), rd(g, IEOB_IRQ_MSK(n)));
++	}
+ 	if (((rd(g, CH_CNTXT(n, 0)) | rd(g, CH_CNTXT(n, 1)) | rd(g, EV_CNTXT(n))) >> 20) & 0xfu) {
+-		printf("PANDORA GPI: gpii %u is in use; left alone\n", n);
+-		ml_io_unmap(g->regs, block_len);
+-		g->regs = 0;
++		if (!quiet) {
++			printf("PANDORA GPI: gpii %u is in use; left alone\n", n);
++		}
+ 		return EBUSY;
+ 	}
+-	if (kmem_alloc_contig(kernel_map, &g->mem, MEM_LEN, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
+-	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+-		return ENOMEM;
++	g->owned = true;
++	if (!g->mem) {
++		if (kmem_alloc_contig(kernel_map, &g->mem, MEM_LEN, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			g->mem = 0;
++			return ENOMEM;
++		}
++		g->mem_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)g->mem));
+ 	}
+-	g->mem_pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)g->mem));
++	bzero((void *)g->mem, MEM_LEN);
+ 	clean_dcache64((addr64_t)g->mem_pa, MEM_LEN, TRUE);
+ 
+ 	/* interrupts as gpi_config_interrupts; nothing takes them, the status is polled */
+@@ -268,8 +283,10 @@
+ 	for (uint32_t k = 0; k < 2 && !e; k++) {
+ 		e = command(g, false, OP_START, k, ST_STARTED);
+ 	}
+-	printf("PANDORA GPI: gpii %u for SE %u: rings at %#llx, tx %#x rx %#x event %#x, err %d\n", n, seid, g->mem_pa,
+-	    rd(g, CH_CNTXT(n, 0)), rd(g, CH_CNTXT(n, 1)), rd(g, EV_CNTXT(n)), e);
++	if (!quiet || e) {
++		printf("PANDORA GPI: gpii %u for SE %u: rings at %#llx, tx %#x rx %#x event %#x, err %d\n", n, seid,
++		    g->mem_pa, rd(g, CH_CNTXT(n, 0)), rd(g, CH_CNTXT(n, 1)), rd(g, EV_CNTXT(n)), e);
++	}
+ 	g->open = e == 0;
+ 	return e;
+ }
+@@ -285,14 +302,19 @@
+ 	int e = 0;
+ 	bool config = true;
+ 	if (nw) {
+-		/* the write: config, GO (write, no STOP when a read follows), DMA from the TX buffer */
+-		memcpy((void *)(g->mem + TX_BUF), w, nw);
+-		clean_dcache64((addr64_t)(g->mem_pa + TX_BUF), BUF_MAX, TRUE);
++		/* the write: config, GO (write, no STOP when a read follows), the bytes; up to 8 go in an
++		 * immediate TRE as Android sends them, longer writes as DMA from the TX buffer */
+ 		PgpiTre t = pgpi_i2c_config0(clk);
+ 		put_tre(g, false, &t);
+-		t = pgpi_i2c_go(PGPI_I2C_WRITE, addr, nr != 0, nw, 0);
++		t = pgpi_i2c_go(PGPI_I2C_WRITE, addr, nr != 0, 0, 0);
+ 		put_tre(g, false, &t);
+-		t = pgpi_dma(g->mem_pa + TX_BUF, nw);
++		if (nw <= 8) {
++			t = pgpi_imm(w, nw);
++		} else {
++			memcpy((void *)(g->mem + TX_BUF), w, nw);
++			clean_dcache64((addr64_t)(g->mem_pa + TX_BUF), BUF_MAX, TRUE);
++			t = pgpi_dma(g->mem_pa + TX_BUF, nw);
++		}
+ 		put_tre(g, false, &t);
+ 		doorbell(g, false);
+ 		e = wait_done(g, 0, &len);
+@@ -321,7 +343,7 @@
+ void
+ pandora_gpi_close(PandoraGpi *g)
+ {
+-	if (!g->regs) {
++	if (!g->regs || !g->owned) {
+ 		return;
+ 	}
+ 	const uint32_t n = g->gpii;
+@@ -347,8 +369,10 @@
+ 	wr(g, GLOB_IRQ_EN(n), 0);
+ 	wr(g, GPII_IRQ_EN(n), 0);
+ 	wr(g, INTSET(n), 0);
+-	printf("PANDORA GPI: gpii %u closed: tx %#x rx %#x event %#x\n", n, rd(g, CH_CNTXT(n, 0)), rd(g, CH_CNTXT(n, 1)),
+-	    rd(g, EV_CNTXT(n)));
+-	g->open = false;
++	if (!g->quiet) {
++		printf("PANDORA GPI: gpii %u closed: tx %#x rx %#x event %#x\n", n, rd(g, CH_CNTXT(n, 0)),
++		    rd(g, CH_CNTXT(n, 1)), rd(g, EV_CNTXT(n)));
++	}
++	g->open = g->owned = false;
+ }
+ #endif /* PANDORA */
+--- a/bsd/dev/pandora_battery.h
++++ b/bsd/dev/pandora_battery.h
+@@ -6,6 +6,7 @@
+ #define PANDORA_BATTERY_H
+ #include <stdbool.h>
+ #include <stddef.h>
++#include <stdint.h>
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -23,6 +24,25 @@
+ /* The latest readings into b (size: sizeof(*b)); false when there are none to use. */
+ bool pandora_battery_get(struct pandora_battery *b, size_t size);
+ 
++/* The bq27z561 gauge's standard commands as last read (bsd/dev/pandora_amp.c, pandora_gauge=3). */
++struct pandora_gauge {
++	int valid;
++	int voltage_mv, current_ma;             /* current: the gauge's sign, positive while charging */
++	int temperature_dk;                     /* 0.1 K */
++	int soc, remaining_mah, full_mah, design_mah, cycles, health;
++	int status;                             /* BatteryStatus (0x0a) */
++	uint64_t at;                            /* mach_absolute_time of the read */
++};
++
++/* The latest gauge reading into g (size: sizeof(*g)); false when there is none. */
++bool pandora_gauge_get(struct pandora_gauge *g, size_t size);
++
++/* Read the gauge now instead of at the next period (charger plugged or unplugged). */
++void pandora_gauge_kick(void);
++
++/* iokit/Kernel/arm/SweetBattery.cpp: take pandora_battery_get's readings now, not at its next poll. */
++void pandora_battery_changed(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/bsd/dev/pandora_gpi.h
++++ b/bsd/dev/pandora_gpi.h
+@@ -21,6 +21,7 @@
+ #define PGPI_TRE_BEI       (1u << 10)
+ #define PGPI_TRE_LINK      (1u << 11)
+ #define PGPI_TRE_DMA       0x10u
++#define PGPI_TRE_IMM       0x11u   /* up to 8 bytes carried in dwords 0-1 (Android's i2c-5 writes, gpicheck) */
+ #define PGPI_TRE_GO        0x20u
+ #define PGPI_TRE_CONFIG0   0x22u
+ 
+@@ -80,6 +81,18 @@
+ 	return t;
+ }
+ 
++/* LEN (1-8) bytes in the TRE itself, as Android's i2c_msm_geni sends a gauge command byte:
++ * gpicheck's live log "tx_tre 0x70 0x0 0x1 0x110200" for command 0x70. */
++static inline PgpiTre
++pgpi_imm(const uint8_t *data, uint32_t len)
++{
++	PgpiTre t = {{0, 0, len & 0xffffffu, PGPI_TRE_IMM << 16 | PGPI_TRE_IEOT}};
++	for (uint32_t i = 0; i < len && i < 8; i++) {
++		t.w[i / 4] |= (uint32_t)data[i] << (8 * (i % 4));
++	}
++	return t;
++}
++
+ typedef struct {
+ 	uint64_t tre;          /* the TRE the event is about (bus address) */
+ 	uint32_t length, code, status, type, chid;
+@@ -113,9 +126,13 @@
+ 	uint32_t ev_rp;        /* next event to look at, bytes into the event ring */
+ 	uint32_t ev_wp;        /* last element handed to the hardware */
+ 	bool open;
++	bool owned;            /* this GPII was free and set up by us: close takes it down */
++	bool quiet;            /* log errors only (periodic users) */
+ } PandoraGpi;
+ 
+-/* Allocate and start the GPII's event ring and both channels; logs every step. 0 or an errno. */
++/* Allocate and start the GPII's event ring and both channels; logs every step unless quiet. The
++ * register mapping and the ring memory stay with G after a close and are used again by the next
++ * open, so a G that is opened and closed repeatedly maps and allocates once. 0 or an errno. */
+ int pandora_gpi_open(PandoraGpi *g, uint64_t block_pa, uint32_t block_len, uint32_t ee_offset, uint32_t gpii,
+     uint32_t seid, uint32_t proto);
+ /* Write NW bytes (if any) to ADDR, then with a repeated start read NR bytes (if any). 0 or an errno. */
+--- /dev/null
++++ b/iokit/Kernel/arm/PandoraAudio.cpp
+@@ -0,0 +1,1067 @@
++/*
++ * The speaker as iOS's built-in audio device, step 1 (0281): our own IOAudio2Device and IOAudio2DeviceUserClient.
++ * Apple's IOAudio2Family is not prelinked here (tools/mkprelink.py keeps AMFI and its libraries only), so the class
++ * names are free; CoreAudio's HALS_IOA2Manager looks devices up with IOServiceMatching("IOAudio2Device").
++ *
++ * The contract, from the iPhone X kernelcache (20H392) and its CoreAudio (PLAN 2026-10-28, iosaudiocheck2-4):
++ *  - the description is in the device's registry properties, lower-case keys with spaces, set by Apple's hardware
++ *    subclasses (AppleARMIISAudio, AppleEmbeddedAudio) with IOAudio2Family's helpers: numbers are 32 bits, sample
++ *    rates 64 bits in 32.32 fixed point (HALS_IOA2UCDevice::GetNominalSampleRate); "transport type" 'bltn';
++ *    "output streams" an array of stream dictionaries ("stream ID", "starting channel", "terminal type",
++ *    "current format", "available formats"); CoreAudio needs "device name" and "device UID";
++ *  - user client: 13 methods (old-style table, every one a device virtual), one trap (DoIO, a no-op for built-in
++ *    devices), clientMemoryForType type >> 28: 0 = the engine status page (u64 sample time, host time, seed, read
++ *    twice by HALS_IOA2Engine2::GetZeroTimeStamp), 1 = the IO buffer of stream (type & 0x0fffffff);
++ *  - order: open, map status and IO buffers, method 0 (engine start) and 10 (StartIOWithFlags), then the IO thread
++ *    reads zero time stamps; 1 and 11 stop.
++ * Step 1 plays nothing: every call is logged, IO runs on a clock of our own (a zero time stamp each time the ring
++ * wraps) and the ring's peak is logged each second, to see that mediaserverd finds the device, opens it, maps the
++ * buffers and writes into them. Boot-arg pandora_audio=1.
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IOMessage.h>
++#include <IOKit/pwr_mgt/RootDomain.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSSymbol.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSString.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <sys/proc.h>
++#include <pexpert/pexpert.h>
++
++#define PA_4CC(a, b, c, d) (((uint32_t)(a) << 24) | ((uint32_t)(b) << 16) | ((uint32_t)(c) << 8) | (uint32_t)(d))
++#define PA_RATE           48000u
++#define PA_CHANNELS       2u
++#define PA_CODEC_MICS     2u                                 /* 0303: the microphones the Codec device carries */
++#define PA_BYTES_FRAME    (PA_CHANNELS * 4u)                 /* 32-bit signed integer, interleaved */
++#define PA_RING_FRAMES    16384u
++#define PA_RING_BYTES     (PA_RING_FRAMES * PA_BYTES_FRAME)
++#define PA_STREAM_ID      1u
++#define PA_STATUS_BYTES   4096u                              /* CoreAudio wants at least 40 */
++#define PA_OUT_LATENCY    480u
++#define PA_OUT_SAFETY     960u
++
++struct PaEngineStatus {                                      /* CoreAudio's IOAudio2EngineStatus {QQQQQ} */
++	volatile uint64_t sample_time;
++	volatile uint64_t host_time;
++	volatile uint64_t seed;
++	uint64_t unused[2];
++};
++
++static void
++pa_num(OSDictionary *d, const char *key, uint64_t value, unsigned bits)
++{
++	OSNumber *n = OSNumber::withNumber(value, bits);
++	if (n != nullptr) {
++		d->setObject(key, n);
++		n->release();
++	}
++}
++
++/* A stream format as IOAudio2Family writes one: "current format" with "sample rate", an entry of "available
++ * formats" with "min sample rate" / "max sample rate". */
++static OSDictionary *
++pa_format(bool range, uint32_t channels = PA_CHANNELS)
++{
++	OSDictionary *f = OSDictionary::withCapacity(10);
++	if (f == nullptr) {
++		return nullptr;
++	}
++	if (range) {
++		pa_num(f, "min sample rate", (uint64_t)PA_RATE << 32, 64);
++		pa_num(f, "max sample rate", (uint64_t)PA_RATE << 32, 64);
++	} else {
++		pa_num(f, "sample rate", (uint64_t)PA_RATE << 32, 64);
++	}
++	pa_num(f, "format ID", PA_4CC('l', 'p', 'c', 'm'), 32);
++	pa_num(f, "format flags", 0x4u | 0x8u, 32);          /* kAudioFormatFlagIsSignedInteger | IsPacked */
++	pa_num(f, "bytes per packet", channels * 4u, 32);
++	pa_num(f, "frames per packet", 1, 32);
++	pa_num(f, "bytes per frame", channels * 4u, 32);
++	pa_num(f, "channels per frame", channels, 32);
++	pa_num(f, "bits per channel", 32, 32);
++	return f;
++}
++
++static OSDictionary *
++pa_stream(bool input, uint32_t id = PA_STREAM_ID, uint32_t terminal = 0, uint32_t channels = PA_CHANNELS,
++    uint32_t max_channels = 0)
++{
++	OSDictionary *s = OSDictionary::withCapacity(6);
++	OSDictionary *cur = pa_format(false, channels), *avail = pa_format(true, channels);
++	OSArray *list = avail == nullptr ? nullptr : OSArray::withObjects((const OSObject **)&avail, 1);
++	for (uint32_t ch = 1; list != nullptr && ch <= max_channels; ch++) {   /* 0303: the other formats offered */
++		if (ch != channels) {
++			OSDictionary *f = pa_format(true, ch);
++			if (f != nullptr) {
++				list->setObject(f);
++			}
++			OSSafeReleaseNULL(f);
++		}
++	}
++	if (s == nullptr || cur == nullptr || list == nullptr) {
++		OSSafeReleaseNULL(s);
++	} else {
++		pa_num(s, "stream ID", id, 32);
++		pa_num(s, "starting channel", 1, 32);
++		/* kAudioStreamTerminalTypeMicrophone / kAudioStreamTerminalTypeSpeaker unless given */
++		pa_num(s, "terminal type", terminal ? terminal : input ? PA_4CC('m', 'i', 'c', 'r') : PA_4CC('s', 'p', 'k', 'r'),
++		    32);
++		s->setObject("current format", cur);
++		s->setObject("available formats", list);
++	}
++	OSSafeReleaseNULL(cur);
++	OSSafeReleaseNULL(avail);
++	OSSafeReleaseNULL(list);
++	return s;
++}
++
++/*
++ * 0299: a control as IOAudio2Family describes one (keys in the iPhone X kernelcache next to "control ID": "base class",
++ * "class", "scope", "element", "read only", "value", "selectors"; CoreAudio's HALS_IOA2UCDevice reads the same).
++ * ITEMS: for a selector, its items {"value", "name"}.
++ */
++static OSDictionary *
++pa_control(uint32_t id, uint32_t base, uint32_t cls, uint32_t scope, uint32_t element, uint32_t value,
++    const uint32_t *items = nullptr, const char *const *names = nullptr, unsigned nitems = 0)
++{
++	OSDictionary *c = OSDictionary::withCapacity(8);
++	if (c == nullptr) {
++		return nullptr;
++	}
++	pa_num(c, "control ID", id, 32);
++	pa_num(c, "base class", base, 32);
++	pa_num(c, "class", cls, 32);
++	pa_num(c, "scope", scope, 32);
++	pa_num(c, "element", element, 32);
++	pa_num(c, "value", value, 32);
++	c->setObject("read only", kOSBooleanFalse);
++	if (nitems) {
++		OSArray *list = OSArray::withCapacity(nitems);
++		for (unsigned i = 0; list != nullptr && i < nitems; i++) {
++			OSDictionary *it = OSDictionary::withCapacity(2);
++			OSString *name = OSString::withCString(names[i]);
++			if (it != nullptr && name != nullptr) {
++				pa_num(it, "value", items[i], 32);
++				it->setObject("name", name);
++				list->setObject(it);
++			}
++			OSSafeReleaseNULL(it);
++			OSSafeReleaseNULL(name);
++		}
++		if (list != nullptr) {
++			c->setObject("selectors", list);
++		}
++		OSSafeReleaseNULL(list);
++	}
++	return c;
++}
++
++class IOAudio2Device : public IOService {
++	OSDeclareDefaultStructors(IOAudio2Device);
++
++public:
++	IOBufferMemoryDescriptor *status_ = nullptr;
++	IOBufferMemoryDescriptor *ring_ = nullptr;
++	IOBufferMemoryDescriptor *in_ring_ = nullptr;           /* 0299: the "Codec" device's input stream (ID 2) */
++	IOLock *lock_ = nullptr;
++	volatile bool running_ = false;
++	volatile bool thread_on_ = false;
++	uint64_t seed_ = 0;
++	uint64_t t0_ = 0;
++	volatile uint32_t traps_ = 0;
++	bool hawking_ = false;                                   /* 0292: the "Hawking" input device, else "Speaker" */
++	bool codec_ = false;                                     /* 0299: the "Codec" device (receiver, microphones) */
++	volatile bool out_active_ = false;                       /* 0300: its output stream set active (method 6) */
++	uint32_t in_channels_ = 1;                               /* 0303: the Codec's microphone stream's channels */
++	volatile bool routed_ = false;                           /* 0293: a client set a stream active */
++	uint64_t rp_ = 0, rp_seed_ = 0;                          /* 0295: where pandora_audio_out_fill reads */
++	uint32_t resyncs_ = 0;
++	uint64_t lv_seed_ = 0, lv_sq_[2] = {};                   /* 0305: the start's levels (pandora_audio_out_fill) */
++	uint32_t lv_frames_ = 0, lv_win_ = 0, lv_peak_[2] = {};
++
++	const char *tag(void) const { return codec_ ? "Codec" : hawking_ ? "Hawking" : "Speaker"; }
++	bool speaker(void) const { return !hawking_ && !codec_; }
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties,
++	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++	IOReturn startIO(void);
++	void stopIO(void);
++	void clockThread(void);
++};
++
++OSDefineMetaClassAndStructors(IOAudio2Device, IOService);
++
++class IOAudio2DeviceUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(IOAudio2DeviceUserClient);
++
++public:
++	IOAudio2Device *device_ = nullptr;
++	char name_[32] = {};
++	bool started_ = false;
++
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	void free(void) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	IOReturn registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
++	IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *dispatch,
++	    OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
++	IOReturn doIO(void *p1, void *p2, void *p3, void *p4, void *p5, void *p6);
++};
++
++OSDefineMetaClassAndStructors(IOAudio2DeviceUserClient, IOUserClient);
++
++/*
++ * 0290/0293: when the speaker is published. VirtualAudio picks a route in full only when ports come or go, and the
++ * speaker port is dropped from the default device's route while the ringer is off ("Culling route connection because
++ * ringer switch is off"); a later ringer change does not bring it back (the default category's routing database entry
++ * is not ringer dependent: "Ringer switch update." -> "Route did not change"). The ringer is off until SpringBoard
++ * posts its state, about 11 s after backboardd reads the switch (SweetHIDButtons::copyEvent; aud13, unified log times
++ * x52). So the speaker is published 3 s after that read and then watched: when VirtualAudio routes the default device
++ * to it, it sets our stream active (aud19: "set stream active" 1 1 at "Route change succeeded"). Without that within
++ * 5 s the speaker is plugged in again (a new instance, the old one terminated), up to 12 times. Fallbacks: first
++ * publication at 120 s uptime if nobody reads the switch; boot-arg pandora_audio_delay=SECONDS a fixed time instead,
++ * pandora_audio_now=1 at once.
++ */
++static volatile bool pa_ringer_known;
++static IOAudio2Device *pa_speaker;                           /* the instance the supervisor publishes (retained) */
++static IOAudio2Device *pa_codec;                             /* 0300: the "Codec" device */
++static IOAudio2Device *volatile pa_out;                      /* 0300: the device the DSP plays (pa_route_update) */
++
++extern "C" void pandora_audio_ringer_known(void);
++void
++pandora_audio_ringer_known(void)
++{
++	pa_ringer_known = true;
++}
++
++/* 0298: the amps' power follows the speaker's IO (bsd/dev/pandora_amp.c); a power off or restart takes them down
++ * first, through the root domain's priority power-state message (IOPMrootDomain::handlePlatformHaltRestart sends
++ * kIOMessageSystemWillPowerOff / WillRestart to these clients one after another and waits for each). */
++#define PA_AMP_WAIT_MS 300u
++extern "C" int pandora_amp_io(int mode, unsigned wait_ms);
++extern "C" void pandora_amp_final(const char *why);
++extern "C" int pandora_adsp_route(unsigned which, unsigned wait_ms);
++
++/*
++ * 0300: the route: the receiver while the "Codec" device runs with its output stream active (VirtualAudio sets the
++ * stream of the port it routes to active, method 6), else the speaker while the "Speaker" device runs, else nothing.
++ * A change goes as on Android: the amps down, the DSP's graph closed and the route's one opened (pandora_adsp.c;
++ * PRM's TDM clock with it), the amps up in the route's mode (pandora_amp.c: speaker, or the top amp alone on the
++ * earpiece). Called before a start's clock starts (STARTING runs from then on), after a stop and when a stream is set
++ * active; the caller waits for it, as a start waits for the amps since 0298.
++ */
++static IOLock *pa_route_lock;
++static int pa_route_mode;                                    /* 0 none, 1 speaker, 2 receiver */
++static const char *const pa_route_name[3] = {"none", "speaker", "receiver"};
++
++static void
++pa_route_update(IOAudio2Device *starting)
++{
++	if (pa_route_lock == nullptr) {
++		return;
++	}
++	IOLockLock(pa_route_lock);
++	IOAudio2Device *spk = pa_speaker, *codec = pa_codec;
++	const bool codec_on = codec != nullptr && (codec->running_ || codec == starting) && codec->out_active_;
++	const bool spk_on = spk != nullptr && (spk->running_ || spk == starting);
++	const int want = codec_on ? 2 : spk_on ? 1 : 0;
++	if (want != pa_route_mode) {
++		const uint64_t t0 = mach_absolute_time();
++		const int down = pa_route_mode ? pandora_amp_io(0, PA_AMP_WAIT_MS) : 0;
++		pa_out = want == 2 ? codec : want == 1 ? spk : nullptr;
++		const int graph = pandora_adsp_route((unsigned)want, 1000);
++		const int up = want ? pandora_amp_io(want, PA_AMP_WAIT_MS) : 0;
++		uint64_t ns = 0;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		IOLog("PANDORA AUDIO: route %s -> %s in %llu ms (amps down %d, graph %d, amps up %d)\n",
++		    pa_route_name[pa_route_mode], pa_route_name[want], ns / NSEC_PER_MSEC, down, graph, up);
++		pa_route_mode = want;
++	}
++	IOLockUnlock(pa_route_lock);
++}
++
++static IOReturn
++pa_power_message(void *, void *, UInt32 type, IOService *, void *, vm_size_t)
++{
++	if (type == kIOMessageSystemWillPowerOff || type == kIOMessageSystemWillRestart) {
++		pandora_amp_final(type == kIOMessageSystemWillRestart ? "restart" : "power off");
++	}
++	return kIOReturnSuccess;
++}
++
++static uint64_t
++pa_uptime_ms(void)
++{
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / NSEC_PER_MSEC;
++}
++
++/* A new speaker instance, started (described) but not published. */
++static IOAudio2Device *
++pa_new_speaker(IOService *provider)
++{
++	IOAudio2Device *d = OSTypeAlloc(IOAudio2Device);
++	if (d == nullptr || !d->init()) {
++		OSSafeReleaseNULL(d);
++		return nullptr;
++	}
++	if (!d->attach(provider)) {
++		d->release();
++		return nullptr;
++	}
++	if (!d->start(provider)) {
++		d->detach(provider);
++		d->release();
++		return nullptr;
++	}
++	return d;
++}
++
++static void
++pa_supervise(void *arg, wait_result_t)
++{
++	IOService *provider = static_cast<IOService *>(arg);
++	int delay = 0, now = 0;
++	(void)PE_parse_boot_argn("pandora_audio_delay", &delay, sizeof(delay));
++	(void)PE_parse_boot_argn("pandora_audio_now", &now, sizeof(now));
++	const char *why;
++	if (now) {
++		why = "at once";
++	} else if (delay > 0) {
++		while (pa_uptime_ms() < (uint64_t)delay * 1000) {
++			IOSleep(200);
++		}
++		why = "fixed delay";
++	} else {
++		while (!pa_ringer_known && pa_uptime_ms() < 120000) {
++			IOSleep(100);
++		}
++		if (pa_ringer_known) {
++			IOSleep(3000);
++			why = "3 s after the ring/silent switch was read";
++		} else {
++			why = "nobody read the ring/silent switch by 120 s";
++		}
++	}
++	for (unsigned attempt = 1;; attempt++) {
++		IOAudio2Device *d = pa_speaker;
++		d->registerService();
++		IOLog("PANDORA AUDIO Speaker: registered at %llu ms (%s, attempt %u)\n", pa_uptime_ms(), why, attempt);
++		for (unsigned t = 0; t < 50 && !d->routed_; t++) {
++			IOSleep(100);
++		}
++		if (d->routed_) {
++			IOLog("PANDORA AUDIO Speaker: routed at %llu ms (attempt %u)\n", pa_uptime_ms(), attempt);
++			break;
++		}
++		if (attempt == 12) {
++			IOLog("PANDORA AUDIO Speaker: not routed after %u attempts, left as it is\n", attempt);
++			break;
++		}
++		IOAudio2Device *n = pa_new_speaker(provider);
++		if (n == nullptr) {
++			IOLog("PANDORA AUDIO Speaker: no memory to plug it in again\n");
++			break;
++		}
++		IOLog("PANDORA AUDIO Speaker: not routed within 5 s, plugging it in again\n");
++		pa_speaker = n;
++		d->terminate();
++		d->release();
++		why = "plugged in again";
++	}
++	provider->release();
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++bool
++IOAudio2Device::start(IOService *provider)
++{
++	int on = 0;
++	(void)PE_parse_boot_argn("pandora_audio", &on, sizeof(on));
++	if (!on || !IOService::start(provider)) {
++		return false;
++	}
++	lock_ = IOLockAlloc();
++	if (pa_route_lock == nullptr) {
++		pa_route_lock = IOLockAlloc();                       /* 0300; devices start one after another */
++	}
++	status_ = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, PA_STATUS_BYTES,
++	    page_size);
++	ring_ = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, PA_RING_BYTES,
++	    page_size);
++	OSDictionary *stream = pa_stream(false);
++	OSArray *outs = stream == nullptr ? nullptr : OSArray::withObjects((const OSObject **)&stream, 1);
++	OSArray *ins = OSArray::withCapacity(1), *controls = OSArray::withCapacity(1);
++	if (lock_ == nullptr || status_ == nullptr || ring_ == nullptr || outs == nullptr || ins == nullptr ||
++	    controls == nullptr) {
++		IOLog("PANDORA AUDIO: no memory for the device\n");
++		OSSafeReleaseNULL(stream);
++		OSSafeReleaseNULL(outs);
++		OSSafeReleaseNULL(ins);
++		OSSafeReleaseNULL(controls);
++		return false;
++	}
++	bzero(status_->getBytesNoCopy(), PA_STATUS_BYTES);
++	bzero(ring_->getBytesNoCopy(), PA_RING_BYTES);
++	/*
++	 * 0292: a second instance (personality PandoraAudioRole = Hawking) is the iPhone's "Hawking" device, one input
++	 * stream. aud18 (VirtualAudio at trace level, speaker published after the ringer was on): the route to the speaker
++	 * is built ("Successfully Built concrete route { pap -> pspk }"), then dropped: the default device needs 8
++	 * alternate devices, Hawking (vhaw, category chaw) among them "Mandatory", and its route [ phki / pap ] has no
++	 * connected 'phki' port ("Recursion failed after skipping optional alternate VAD"), so the null device stays.
++	 * VirtualAudio's Device_Hawking_Aspen makes 'phki' ("Hawking Input") and an input volume control from the device
++	 * with UID "Hawking" (iPhone X: AppleSecondaryAudio "Hawking", /arm-io/mca4/mca4b/audio-codec-hawking). It is not
++	 * tied to the ringer and is published at once. Its input stays silent.
++	 */
++	OSString *role = OSDynamicCast(OSString, getProperty("PandoraAudioRole"));
++	hawking_ = role != nullptr && role->isEqualTo("Hawking");
++	if (hawking_) {
++		OSArray *t = outs;
++		outs = ins;
++		ins = t;
++		OSSafeReleaseNULL(stream);
++		stream = pa_stream(true);
++		if (stream == nullptr) {
++			IOLog("PANDORA AUDIO Hawking: no memory for the input stream\n");
++			OSSafeReleaseNULL(outs);
++			OSSafeReleaseNULL(ins);
++			OSSafeReleaseNULL(controls);
++			return false;
++		}
++		ins->replaceObject(0, stream);
++		setProperty("device UID", "Hawking");
++		setProperty("device name", "Hawking");
++		setProperty("device manufacturer", "Pandora");
++		setProperty("transport type", PA_4CC('b', 'l', 't', 'n'), 32);
++		setProperty("sample rate", (unsigned long long)PA_RATE << 32, 64);
++		setProperty("io buffer frame size", PA_RING_FRAMES, 32);
++		setProperty("output latency", 0ull, 32);
++		setProperty("output safety offset", 0ull, 32);
++		setProperty("input latency", PA_OUT_LATENCY, 32);
++		setProperty("input safety offset", PA_OUT_SAFETY, 32);
++		setProperty("clock domain", PA_4CC('p', 'a', 'n', 'd'), 32);
++		setProperty("output streams", outs);
++		setProperty("input streams", ins);
++		setProperty("controls", controls);
++		OSSafeReleaseNULL(stream);
++		OSSafeReleaseNULL(outs);
++		OSSafeReleaseNULL(ins);
++		OSSafeReleaseNULL(controls);
++		registerService();
++		IOLog("PANDORA AUDIO Hawking: registered: 1 input stream, %u Hz, %u channels, s32, ring %u frames\n", PA_RATE,
++		    PA_CHANNELS, PA_RING_FRAMES);
++		return true;
++	}
++	/*
++	 * 0299: a third instance (personality PandoraAudioRole = Codec) is the iPhone's "Codec" device (iPhone X:
++	 * AppleCS42L75Audio's "Codec": receiver, headphones and microphones). VirtualAudio's Device_Codec_Aspen
++	 * (0x23f8d0) makes its ports from the device's properties: a receiver port ("Built-In Receiver") when
++	 * kAudioDevicePropertyMute exists on output element 3 (element 4 makes a speaker port, 5 hearing aid
++	 * compliance), an internal microphone port when kAudioDevicePropertyDataSources ('ssc#') on the input scope lists
++	 * one of imic, smic, fmic, lmic, tmic, umic, imi1-imi4 and the transducer database has imic or imi1. In IOAudio2
++	 * terms: a mute control on output element 3 and a data source selector on the input. Output stream 1 (the
++	 * receiver), input stream 2 (the microphones, silent until they are driven). Published at once, as Hawking.
++	 * 0303: aud31: every route with the built-in microphone failed to activate: its DSP chain "d22_bottom_mic_general"
++	 * has an AUAGCV2 that refused the 2-channel format ("DSP (agc2) format setup failed with error: (-10868) ...
++	 * [ 32/48000/2 ...]", "Routing is not supported"), so play-and-record fell back to the speaker. The device now
++	 * describes its channels as iPhone X's AppleEmbeddedAudio does (kernelcache 20H392, 0xfffffff00597c3a0):
++	 * "maxChannelCount" {"MaxOutputChannelCount", "MaxInputChannelCount": the hardware's channels},
++	 * "LowPowerEnableChannelMask" and "LowPowerActiveChannelMask" 0, and "custom property info", the table HAL reads
++	 * its custom properties through ({"property selector", "registry key"}: 'MCCs' maxChannelCount, 'LPEm', 'LPAm');
++	 * VirtualAudio's Device_Codec_Aspen reads MaxInputChannelCount from 'MCCs'. The input carries this phone's
++	 * microphones: two, as Android's handset recording (handset-dmic-endfire: AMIC1 bottom and AMIC4).
++	 * aud32: the same refusal with two channels; HAL never asked for another format (method 5), as only one was
++	 * offered. The stream now offers mono (current: one microphone, what iPhone X's general recording chain takes)
++	 * and two channels; method 5 switches between them.
++	 */
++	codec_ = role != nullptr && role->isEqualTo("Codec");
++	if (codec_) {
++		static const uint32_t mics[5] = {PA_4CC('i', 'm', 'i', '1'), PA_4CC('i', 'm', 'i', '2'),
++		    PA_4CC('i', 'm', 'i', '3'), PA_4CC('i', 'm', 'i', '4'), PA_4CC('i', 'm', 'i', 'c')};
++		static const char *const mic_names[5] = {"Bottom", "Front", "Back", "Top", "Microphone"};
++		in_ring_ = IOBufferMemoryDescriptor::withOptions(kIODirectionInOut | kIOMemoryKernelUserShared, PA_RING_BYTES,
++		    page_size);
++		OSSafeReleaseNULL(stream);
++		stream = pa_stream(false, 1, PA_4CC('r', 's', 'p', 'k'));     /* kAudioStreamTerminalTypeReceiverSpeaker */
++		OSDictionary *in = pa_stream(true, 2, 0, in_channels_, PA_CODEC_MICS);
++		OSDictionary *mute = pa_control(1, PA_4CC('t', 'o', 'g', 'l'), PA_4CC('m', 'u', 't', 'e'),
++		    PA_4CC('o', 'u', 't', 'p'), 3, 0);
++		OSDictionary *source = pa_control(2, PA_4CC('s', 'l', 'c', 't'), PA_4CC('d', 's', 'r', 'c'),
++		    PA_4CC('i', 'n', 'p', 't'), 0, mics[0], mics, mic_names, 5);
++		if (in_ring_ == nullptr || stream == nullptr || in == nullptr || mute == nullptr || source == nullptr) {
++			IOLog("PANDORA AUDIO Codec: no memory for the device\n");
++			OSSafeReleaseNULL(stream);
++			OSSafeReleaseNULL(in);
++			OSSafeReleaseNULL(mute);
++			OSSafeReleaseNULL(source);
++			OSSafeReleaseNULL(outs);
++			OSSafeReleaseNULL(ins);
++			OSSafeReleaseNULL(controls);
++			return false;
++		}
++		bzero(in_ring_->getBytesNoCopy(), PA_RING_BYTES);
++		outs->replaceObject(0, stream);
++		ins->setObject(in);
++		controls->setObject(mute);
++		controls->setObject(source);
++		setProperty("device UID", "Codec");
++		setProperty("device name", "Codec");
++		setProperty("device manufacturer", "Pandora");
++		setProperty("transport type", PA_4CC('b', 'l', 't', 'n'), 32);
++		setProperty("sample rate", (unsigned long long)PA_RATE << 32, 64);
++		setProperty("io buffer frame size", PA_RING_FRAMES, 32);
++		setProperty("output latency", PA_OUT_LATENCY, 32);
++		setProperty("output safety offset", PA_OUT_SAFETY, 32);
++		setProperty("input latency", PA_OUT_LATENCY, 32);
++		setProperty("input safety offset", PA_OUT_SAFETY, 32);
++		setProperty("clock domain", PA_4CC('p', 'a', 'n', 'd'), 32);
++		setProperty("output streams", outs);
++		setProperty("input streams", ins);
++		setProperty("controls", controls);
++		{
++			OSDictionary *maxc = OSDictionary::withCapacity(2);
++			OSArray *info = OSArray::withCapacity(3);
++			static const struct {
++				uint32_t selector;
++				const char *key;
++			} custom[3] = {{PA_4CC('M', 'C', 'C', 's'), "maxChannelCount"},
++			    {PA_4CC('L', 'P', 'E', 'm'), "LowPowerEnableChannelMask"},
++			    {PA_4CC('L', 'P', 'A', 'm'), "LowPowerActiveChannelMask"}};
++			if (maxc != nullptr && info != nullptr) {
++				pa_num(maxc, "MaxOutputChannelCount", PA_CHANNELS, 32);
++				pa_num(maxc, "MaxInputChannelCount", PA_CODEC_MICS, 32);
++				setProperty("maxChannelCount", maxc);
++				setProperty("LowPowerEnableChannelMask", 0ull, 32);
++				setProperty("LowPowerActiveChannelMask", 0ull, 32);
++				for (unsigned i = 0; i < 3; i++) {
++					OSDictionary *e = OSDictionary::withCapacity(2);
++					OSString *k = OSString::withCString(custom[i].key);
++					if (e != nullptr && k != nullptr) {
++						pa_num(e, "property selector", custom[i].selector, 32);
++						e->setObject("registry key", k);
++						info->setObject(e);
++					}
++					OSSafeReleaseNULL(e);
++					OSSafeReleaseNULL(k);
++				}
++				setProperty("custom property info", info);
++			}
++			OSSafeReleaseNULL(maxc);
++			OSSafeReleaseNULL(info);
++		}
++		OSSafeReleaseNULL(stream);
++		OSSafeReleaseNULL(in);
++		OSSafeReleaseNULL(mute);
++		OSSafeReleaseNULL(source);
++		OSSafeReleaseNULL(outs);
++		OSSafeReleaseNULL(ins);
++		OSSafeReleaseNULL(controls);
++		pa_codec = this;
++		registerService();
++		IOLog("PANDORA AUDIO Codec: registered: receiver output (mute control, element 3), microphone input "
++		    "(data source selector), %u Hz, %u channels out, %u in, s32\n", PA_RATE, PA_CHANNELS, PA_CODEC_MICS);
++		return true;
++	}
++	/* 0282: the UID VirtualAudio looks the speaker up by (aud1: HAL activated "PandoraBuiltInSpeaker" as device 33,
++	 * but VirtualAudio built no route to it). Its table of physical devices takes the iPhone's UIDs: "Codec"
++	 * (CS42L75: receiver, headphones, mics), "Speaker" (CS35L26), "Voice", "Reference", "Baseband Voice". */
++	/* 0283: boot-arg pandora_audio_tt=1 makes it a Thunderbolt device, as sheng's plug-in on iPadOS 17
++	 * (VirtualAudio there routes a Thunderbolt device as a generic driver device; built-in devices it takes only
++	 * from the product's transducer database). aud2/aud3 (built-in, UID "Speaker"): still no route.
++	 * 0291: aud12-aud14 (built-in "Speaker", VirtualAudio loaded): no category ever gets a route to the speaker port,
++	 * whatever the ringer; the iPhone X routing database wants more than this one device. The Thunderbolt device
++	 * takes its own UID so that VirtualAudio does not build the built-in speaker (Device_Speaker_Aspen) from it. */
++	int tt = 0;
++	(void)PE_parse_boot_argn("pandora_audio_tt", &tt, sizeof(tt));
++	setProperty("device UID", tt == 1 ? "PandoraSpeaker" : "Speaker");
++	setProperty("device name", "Speaker");
++	setProperty("device manufacturer", "Pandora");
++	setProperty("transport type", tt == 1 ? PA_4CC('t', 'h', 'u', 'n') : PA_4CC('b', 'l', 't', 'n'), 32);
++	setProperty("sample rate", (unsigned long long)PA_RATE << 32, 64);
++	setProperty("io buffer frame size", PA_RING_FRAMES, 32);
++	setProperty("output latency", PA_OUT_LATENCY, 32);
++	setProperty("output safety offset", PA_OUT_SAFETY, 32);
++	setProperty("input latency", 0ull, 32);
++	setProperty("input safety offset", 0ull, 32);
++	setProperty("clock domain", PA_4CC('p', 'a', 'n', 'd'), 32);
++	setProperty("output streams", outs);
++	setProperty("input streams", ins);
++	setProperty("controls", controls);
++	OSSafeReleaseNULL(stream);
++	OSSafeReleaseNULL(outs);
++	OSSafeReleaseNULL(ins);
++	OSSafeReleaseNULL(controls);
++	/* 0293: published and watched by pa_supervise; an instance made to plug the speaker in again is published there. */
++	if (pa_speaker == nullptr) {
++		retain();
++		pa_speaker = this;
++		if (registerPrioritySleepWakeInterest(pa_power_message, this, nullptr) == nullptr) {
++			IOLog("PANDORA AUDIO Speaker: no power-off message: the amps are not taken down first\n");
++		}
++		provider->retain();
++		thread_t thread;
++		if (kernel_thread_start(pa_supervise, provider, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		} else {
++			provider->release();
++			registerService();
++		}
++	}
++	IOLog("PANDORA AUDIO Speaker: made: 1 output stream, %u Hz, %u channels, s32, ring %u frames\n", PA_RATE,
++	    PA_CHANNELS, PA_RING_FRAMES);
++	return true;
++}
++
++void
++IOAudio2Device::free(void)
++{
++	OSSafeReleaseNULL(status_);
++	OSSafeReleaseNULL(ring_);
++	OSSafeReleaseNULL(in_ring_);
++	if (lock_ != nullptr) {
++		IOLockFree(lock_);
++		lock_ = nullptr;
++	}
++	IOService::free();
++}
++
++/*
++ * 0287 (aud7: VirtualAudio loaded, but "HALB_UCObject::SetProperty: got an error from the IORegistry, Error:
++ * 0xE00002C7", "Unable to take hog mode.", "Could not add PhysicalDevice ID: 33"): clients set registry properties
++ * on the device, first "exclusive access owner" (hog mode; HALS_IOA2Device::_ReadHogModeOwnerStore reads it back).
++ * Every key is kept as given and logged.
++ */
++IOReturn
++IOAudio2Device::setProperties(OSObject *properties)
++{
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	OSCollectionIterator *it = d == nullptr ? nullptr : OSCollectionIterator::withCollection(d);
++	if (it == nullptr) {
++		IOLog("PANDORA AUDIO: setProperties without a dictionary\n");
++		return kIOReturnBadArgument;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	while (const OSSymbol *k = OSDynamicCast(OSSymbol, it->getNextObject())) {
++		OSObject *v = d->getObject(k);
++		OSNumber *n = OSDynamicCast(OSNumber, v);
++		OSString *s = OSDynamicCast(OSString, v);
++		IOLog("PANDORA AUDIO %s: %s sets \"%s\" = %s%llu%s\n", tag(), name, k->getCStringNoCopy(),
++		    n != nullptr ? "" : s != nullptr ? s->getCStringNoCopy() : v->getMetaClass()->getClassName(),
++		    n != nullptr ? n->unsigned64BitValue() : 0ull, n != nullptr ? "" : " (not a number)");
++		setProperty(k, v);
++	}
++	it->release();
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOAudio2Device::newUserClient(task_t owningTask, void *securityID, UInt32 type, __unused OSDictionary *properties,
++    IOUserClient **handler)
++{
++	IOAudio2DeviceUserClient *uc = OSTypeAlloc(IOAudio2DeviceUserClient);
++	if (uc == nullptr || !uc->initWithTask(owningTask, securityID, type)) {
++		OSSafeReleaseNULL(uc);
++		return kIOReturnNoMemory;
++	}
++	retain();                                                /* 0293: a speaker plugged in again is terminated */
++	uc->device_ = this;
++	proc_selfname(uc->name_, sizeof(uc->name_));
++	if (!uc->attach(this) || !uc->start(this)) {
++		uc->detach(this);
++		uc->release();
++		return kIOReturnError;
++	}
++	IOLog("PANDORA AUDIO %s: opened by %s (type %u)\n", tag(), uc->name_, (unsigned)type);
++	*handler = uc;
++	return kIOReturnSuccess;
++}
++
++/* Sample time of ring wrap N: N * ring; its host time: t0 + N * ring / rate seconds (exact, no drift). */
++static uint64_t
++pa_wrap_host(uint64_t t0, uint64_t n)
++{
++	uint64_t abs = 0;
++	nanoseconds_to_absolutetime(n * PA_RING_FRAMES * 62500ull / 3ull, &abs);   /* 1e9 / 48000 = 62500 / 3 */
++	return t0 + abs;
++}
++
++static void
++pa_publish(IOAudio2Device *d, uint64_t n)
++{
++	PaEngineStatus *st = (PaEngineStatus *)d->status_->getBytesNoCopy();
++	st->sample_time = n * PA_RING_FRAMES;
++	st->host_time = pa_wrap_host(d->t0_, n);
++	st->seed = d->seed_;
++	__asm__ volatile ("dmb ish" ::: "memory");
++}
++
++void
++IOAudio2Device::clockThread(void)
++{
++	uint64_t n = 0, last_log = mach_absolute_time(), one_s = 0;
++	nanoseconds_to_absolutetime(NSEC_PER_SEC, &one_s);
++	while (running_) {
++		IOSleep(5);
++		const uint64_t now = mach_absolute_time();
++		while (running_ && pa_wrap_host(t0_, n + 1) <= now) {
++			pa_publish(this, ++n);
++		}
++		if (now - last_log >= one_s) {
++			last_log = now;
++			const int32_t *s = (const int32_t *)ring_->getBytesNoCopy();
++			uint32_t peak = 0, nonzero = 0;
++			for (uint32_t i = 0; i < PA_RING_FRAMES * PA_CHANNELS; i++) {
++				const uint32_t a = s[i] < 0 ? (uint32_t)-(int64_t)s[i] : (uint32_t)s[i];
++				peak = a > peak ? a : peak;
++				nonzero += s[i] != 0;
++			}
++			IOLog("PANDORA AUDIO %s: running: wrap %llu, ring peak %#x, %u of %u samples nonzero, traps %u, DSP reads at "
++			    "%llu (%u restarts)\n", tag(), n, peak, nonzero, PA_RING_FRAMES * PA_CHANNELS, traps_, rp_, resyncs_);
++		}
++	}
++	thread_on_ = false;
++}
++
++static void
++pa_clock_thread(void *arg, wait_result_t)
++{
++	static_cast<IOAudio2Device *>(arg)->clockThread();
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++IOReturn
++IOAudio2Device::startIO(void)
++{
++	/* 0298: the amps up before the clock starts (Android powers them up before its first buffer, iOS before the
++	 * engine runs): the start waits for them, up to PA_AMP_WAIT_MS, and goes on either way. 0300: the route's graph
++	 * and amps (pa_route_update). */
++	if (!hawking_ && !running_) {
++		pa_route_update(this);
++	}
++	for (unsigned t = 0; t < 50 && !running_ && thread_on_; t++) {
++		IOSleep(10);                                     /* the last run's clock thread is still leaving */
++	}
++	IOLockLock(lock_);
++	if (running_ || thread_on_) {
++		IOLockUnlock(lock_);
++		return running_ ? kIOReturnSuccess : kIOReturnBusy;
++	}
++	seed_++;
++	bzero(ring_->getBytesNoCopy(), PA_RING_BYTES);           /* 0295: no tail of the last run reaches the DSP */
++	if (in_ring_ != nullptr) {
++		bzero(in_ring_->getBytesNoCopy(), PA_RING_BYTES);    /* 0299: the microphones are silent for now */
++	}
++	t0_ = mach_absolute_time();
++	pa_publish(this, 0);
++	running_ = true;
++	thread_on_ = true;
++	thread_t thread;
++	if (kernel_thread_start(pa_clock_thread, this, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		running_ = false;
++		thread_on_ = false;
++	}
++	IOLockUnlock(lock_);
++	IOLog("PANDORA AUDIO %s: IO started (seed %llu)\n", tag(), seed_);
++	return running_ ? kIOReturnSuccess : kIOReturnNoResources;
++}
++
++void
++IOAudio2Device::stopIO(void)
++{
++	IOLockLock(lock_);
++	const bool was = running_;
++	running_ = false;
++	IOLockUnlock(lock_);
++	if (was) {
++		IOLog("PANDORA AUDIO %s: IO stopped\n", tag());
++		if (!hawking_) {
++			pa_route_update(nullptr);          /* 0298/0300: the amps down and the graph closed, as Android's standby */
++		}
++	}
++}
++
++/*
++ * 0295: the speaker's samples for the audio DSP (pandora_adsp.c, pandora_spk_live=1): FRAMES interleaved s32 stereo
++ * frames, slot 0 the top amp, slot 1 the bottom, as the ring holds them. Silence when IO is not running. The DSP takes
++ * a 20 ms buffer each time one comes back and keeps four queued; reads follow on from the last one and stay behind
++ * the sample time of now (our clock, the one the zero time stamps come from), where HAL has written already: it
++ * writes the safety offset (960 frames) ahead of now. A run starts PA_OUT_LAG + 4 buffers back so that after the
++ * first four the reads are PA_OUT_LAG behind; a read ahead of now or more than PA_OUT_SLACK behind starts over there.
++ * Returns the frames taken from the ring.
++ */
++#define PA_OUT_LAG        960u
++#define PA_OUT_SLACK      (PA_RING_FRAMES / 2u)
++
++extern "C" uint32_t pandora_audio_out_fill(int32_t *dst, uint32_t frames);
++uint32_t
++pandora_audio_out_fill(int32_t *dst, uint32_t frames)
++{
++	IOAudio2Device *d = pa_out;                               /* 0300: the route's device */
++	if (d == nullptr || !d->running_ || d->ring_ == nullptr || frames > PA_RING_FRAMES) {
++		bzero(dst, (size_t)frames * PA_BYTES_FRAME);
++		return 0;
++	}
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - d->t0_, &ns);
++	const uint64_t now = ns * 3u / 62500u;                    /* frames at 48 kHz */
++	const uint64_t start_back = PA_OUT_LAG + 4u * frames;
++	if (d->rp_seed_ != d->seed_ || d->rp_ + frames > now || d->rp_ + PA_OUT_SLACK < now) {
++		if (d->rp_seed_ == d->seed_) {
++			d->resyncs_++;
++		}
++		d->rp_seed_ = d->seed_;
++		d->rp_ = now > start_back ? now - start_back : 0;
++	}
++	const int32_t *ring = (const int32_t *)d->ring_->getBytesNoCopy();
++	const uint32_t at = (uint32_t)(d->rp_ % PA_RING_FRAMES);
++	const uint32_t first = frames < PA_RING_FRAMES - at ? frames : PA_RING_FRAMES - at;
++	memcpy(dst, ring + (size_t)at * PA_CHANNELS, (size_t)first * PA_BYTES_FRAME);
++	if (first < frames) {
++		memcpy(dst + (size_t)first * PA_CHANNELS, ring, (size_t)(frames - first) * PA_BYTES_FRAME);
++	}
++	d->rp_ += frames;
++	/*
++	 * 0305: the user hears the speaker's sound start low and reach its level after a few seconds (aud31, aud33), and
++	 * iOS's samples in the ring rise by about 9 dB over 4 s where the file's peaks rise by 1.4 dB. Per channel, every
++	 * 100 ms for 6 s after each start: the peak and the RMS (16-bit scale) of what the DSP gets, to compare with the
++	 * file's envelope and between the channels (AURotationShading in iPhone X's speaker chain sets their balance).
++	 */
++	if (d->lv_seed_ != d->seed_) {
++		d->lv_seed_ = d->seed_;
++		d->lv_frames_ = d->lv_win_ = 0;
++		d->lv_peak_[0] = d->lv_peak_[1] = 0;
++		d->lv_sq_[0] = d->lv_sq_[1] = 0;
++	}
++	for (uint32_t f = 0; d->lv_win_ < 60 && f < frames; f++) {
++		for (unsigned c = 0; c < 2; c++) {
++			const int32_t v = dst[2 * f + c];
++			const uint32_t a = v < 0 ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
++			const uint64_t h = a >> 16;
++			d->lv_peak_[c] = a > d->lv_peak_[c] ? a : d->lv_peak_[c];
++			d->lv_sq_[c] += h * h;
++		}
++		if (++d->lv_frames_ == PA_RATE / 10u) {
++			uint32_t rms[2];
++			for (unsigned c = 0; c < 2; c++) {
++				const uint64_t m = d->lv_sq_[c] / (PA_RATE / 10u);
++				uint32_t r = 0;
++				while ((uint64_t)(r + 1) * (r + 1) <= m) {
++					r++;
++				}
++				rms[c] = r;
++			}
++			d->lv_win_++;
++			IOLog("PANDORA AUDIO %s: out +%u ms: L peak %#x rms %u, R peak %#x rms %u\n", d->tag(), d->lv_win_ * 100u,
++			    d->lv_peak_[0], rms[0], d->lv_peak_[1], rms[1]);
++			d->lv_frames_ = 0;
++			d->lv_peak_[0] = d->lv_peak_[1] = 0;
++			d->lv_sq_[0] = d->lv_sq_[1] = 0;
++		}
++	}
++	/*
++	 * 0306: the speaker's channels as iPhone X's: channel 0 for the bottom (main) speaker, channel 1 for the top one
++	 * (on iPhone X the receiver doubles as it), which iOS's speaker chain shades by orientation (AURotationShading).
++	 * aud35: iOS's channel 0 carried the full signal from the start, channel 1 started 8-12 dB lower and rose by about
++	 * 7 dB over 5 s; with channel 0 on TDM slot 0 (the top amp, Android's left) the bottom speaker played the shaded
++	 * channel, heard as a slow start. The DSP's slot 0 drives the top amp, slot 1 the bottom: the two swap here.
++	 */
++	if (d->speaker()) {
++		for (uint32_t f = 0; f < frames; f++) {
++			const int32_t t = dst[2 * f];
++			dst[2 * f] = dst[2 * f + 1];
++			dst[2 * f + 1] = t;
++		}
++	}
++	return frames;
++}
++
++IOReturn
++IOAudio2DeviceUserClient::clientClose(void)
++{
++	if (started_ && device_ != nullptr) {
++		device_->stopIO();
++		started_ = false;
++	}
++	IOLog("PANDORA AUDIO %s: closed by %s\n", device_ != nullptr ? device_->tag() : "?", name_);
++	terminate();
++	return kIOReturnSuccess;
++}
++
++void
++IOAudio2DeviceUserClient::free(void)
++{
++	OSSafeReleaseNULL(device_);
++	IOUserClient::free();
++}
++
++IOReturn
++IOAudio2DeviceUserClient::setProperties(OSObject *properties)
++{
++	return device_ != nullptr ? device_->setProperties(properties) : kIOReturnNotReady;
++}
++
++IOReturn
++IOAudio2DeviceUserClient::registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon)
++{
++	IOLog("PANDORA AUDIO %s: %s: notification port %s, type %u, ref %#llx\n",
++	    device_ != nullptr ? device_->tag() : "?", name_, port ? "set" : "cleared", (unsigned)type,
++	    (unsigned long long)refCon);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++IOAudio2DeviceUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	IOMemoryDescriptor *md = nullptr;
++	if (device_ != nullptr && (type >> 28) == 0) {
++		md = device_->status_;
++	} else if (device_ != nullptr && (type >> 28) == 1 && (type & 0x0fffffffu) == PA_STREAM_ID) {
++		md = device_->ring_;
++	} else if (device_ != nullptr && (type >> 28) == 1 && (type & 0x0fffffffu) == 2 && device_->in_ring_ != nullptr) {
++		md = device_->in_ring_;
++	}
++	IOLog("PANDORA AUDIO %s: %s maps type %#x (options %#x): %s\n", device_ != nullptr ? device_->tag() : "?",
++	    name_, (unsigned)type, options != nullptr ? (unsigned)*options : 0u, md == nullptr ? "refused" :
++	    (type >> 28) == 0 ? "engine status" : "IO buffer");
++	if (md == nullptr) {
++		return kIOReturnBadArgument;
++	}
++	md->retain();
++	*memory = md;
++	return kIOReturnSuccess;
++}
++
++IOExternalTrap *
++IOAudio2DeviceUserClient::getTargetAndTrapForIndex(IOService **targetP, UInt32 index)
++{
++	static IOExternalTrap trap = {nullptr, static_cast<IOTrap>(&IOAudio2DeviceUserClient::doIO)};
++	if (index != 0) {
++		return nullptr;
++	}
++	*targetP = this;
++	return &trap;
++}
++
++IOReturn
++IOAudio2DeviceUserClient::doIO(void *, void *, void *, void *, void *, void *)
++{
++	if (device_ != nullptr) {
++		device_->traps_++;
++	}
++	return kIOReturnSuccess;
++}
++
++static const char *const pa_method_names[13] = {"engine start", "engine stop", "set control value",
++	                                         "config change", "property action", "set stream format",
++	                                         "set stream active", "move data exchange block",
++	                                         "set multi control value", "move block control data",
++	                                         "start IO with flags", "stop IO with flags", "client description"};
++
++IOReturn
++IOAudio2DeviceUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *a,
++    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
++{
++	if (device_ == nullptr || selector >= 13) {
++		IOLog("PANDORA AUDIO %s: %s: method %u refused\n", device_ != nullptr ? device_->tag() : "?", name_,
++		    selector);
++		return kIOReturnUnsupported;
++	}
++	uint64_t s[4] = {};
++	for (uint32_t i = 0; i < a->scalarInputCount && i < 4; i++) {
++		s[i] = a->scalarInput[i];
++	}
++	IOLog("PANDORA AUDIO %s: %s: method %u (%s): %u scalars %#llx %#llx %#llx, struct in %u, out %u scalars %u "
++	    "struct\n", device_->tag(), name_, selector, pa_method_names[selector], a->scalarInputCount, s[0], s[1], s[2],
++	    a->structureInputSize, a->scalarOutputCount, a->structureOutputSize);
++	IOReturn ret = kIOReturnSuccess;
++	switch (selector) {
++	case 2:                                                  /* set control value: echo the value */
++		if (a->scalarOutputCount >= 1) {
++			a->scalarOutput[0] = s[1];
++		}
++		break;
++	case 5:                                                  /* stream id + AudioStreamBasicDescription */
++		if (a->structureInputSize >= 40 && a->structureInput != nullptr) {
++			const uint8_t *b = (const uint8_t *)a->structureInput;
++			uint64_t rate_bits;                      /* a double; no floating point in the kernel */
++			uint32_t f[8];
++			memcpy(&rate_bits, b, 8);
++			memcpy(f, b + 8, 32);
++			IOLog("PANDORA AUDIO %s: %s: format of stream %llu: rate bits %#llx (48000.0 = 0x40e7700000000000) "
++			    "id %#x flags %#x %u B/packet %u frames/packet %u B/frame %u ch %u bits\n", device_->tag(), name_, s[0],
++			    rate_bits, f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
++			/* 0303: the Codec's microphone stream takes 1 or 2 channels; its "current format" follows */
++			if (device_->codec_ && s[0] == 2 && f[5] >= 1 && f[5] <= PA_CODEC_MICS && f[5] != device_->in_channels_) {
++				OSDictionary *in = pa_stream(true, 2, 0, f[5], PA_CODEC_MICS);
++				OSArray *ins = in == nullptr ? nullptr : OSArray::withObjects((const OSObject **)&in, 1);
++				if (ins != nullptr) {
++					device_->setProperty("input streams", ins);
++					device_->in_channels_ = f[5];
++					IOLog("PANDORA AUDIO Codec: microphone stream now %u channels\n", f[5]);
++				} else {
++					ret = kIOReturnNoMemory;
++				}
++				OSSafeReleaseNULL(in);
++				OSSafeReleaseNULL(ins);
++			}
++		}
++		break;
++	case 6:                                                  /* stream ID, active */
++		if (s[1] != 0) {
++			device_->routed_ = true;
++		}
++		if (s[0] == PA_STREAM_ID && !device_->hawking_) {
++			const bool was = device_->out_active_;
++			device_->out_active_ = s[1] != 0;
++			if (was != device_->out_active_ && device_->running_) {
++				pa_route_update(nullptr);                    /* 0300: VirtualAudio moved the output while running */
++			}
++		}
++		break;
++	case 8:
++		ret = kIOReturnUnsupported;
++		break;
++	case 0:
++	/* 0294: aud20: the default device routed to us, the plug-in sound 1106 starts IO with method 0 (engine start)
++	 * and no method 10; HAL waits for the first zero time stamp, gives up after 5 s ("the IO thread failed to start,
++	 * Error: 'nope'") and sends method 1. The clock starts with either. */
++	case 10:
++		ret = device_->startIO();
++		started_ = ret == kIOReturnSuccess;
++		if (a->scalarOutputCount >= 1) {
++			a->scalarOutput[0] = 0;
++		}
++		break;
++	case 1:
++	case 11:
++		device_->stopIO();
++		started_ = false;
++		if (a->scalarOutputCount >= 1) {
++			a->scalarOutput[0] = 0;
++		}
++		break;
++	default:
++		break;
++	}
++	return ret;
++}
++#endif /* SWEET */
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -1,27 +1,28 @@
+-iokit/Families/IONVRAM/IONVRAMController.cpp				optional iokitcpp
+-
+-# Power Domains
+-iokit/Kernel/IOPMrootDomain.cpp    					optional iokitcpp
+-
+-# SMP
+-iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
+-
+-# SWEET device-tree platform (empty translation unit on other boards)
+-iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
+-
+-iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
+-iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
+-iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
+-iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+-iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+-iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+-iokit/Kernel/arm/FuxiAdrenoUserClient.cpp                         optional iokitcpp
+-iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+-iokit/Kernel/arm/PandoraPMGRNub.cpp                              optional iokitcpp
+-iokit/Kernel/arm/PandoraAdrenoGpu.cpp                            optional iokitcpp
+-iokit/Kernel/arm/PandoraIpcc.cpp                                 optional iokitcpp
+-iokit/Kernel/arm/SweetGIC.cpp                                    optional iokitcpp
+-iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+-iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+-iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+-iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
++iokit/Families/IONVRAM/IONVRAMController.cpp				optional iokitcpp
++
++# Power Domains
++iokit/Kernel/IOPMrootDomain.cpp    					optional iokitcpp
++
++# SMP
++iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
++
++# SWEET device-tree platform (empty translation unit on other boards)
++iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
++
++iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
++iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
++iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
++iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
++iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/FuxiAdrenoUserClient.cpp                         optional iokitcpp
++iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/PandoraPMGRNub.cpp                              optional iokitcpp
++iokit/Kernel/arm/PandoraAdrenoGpu.cpp                            optional iokitcpp
++iokit/Kernel/arm/PandoraIpcc.cpp                                 optional iokitcpp
++iokit/Kernel/arm/SweetGIC.cpp                                    optional iokitcpp
++iokit/Kernel/arm/PandoraAudio.cpp                                optional iokitcpp
++iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
++iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
++iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
++iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
