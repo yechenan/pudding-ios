@@ -135,6 +135,59 @@ iOS 会一直跑，屏幕上看到什么就停在哪；要回安卓就长按电�
 22. **`pandora_reboot_after` 不传 = 不自动回安卓**。手机停在 iOS，直到长按电源 ~10 秒；
     日志每秒落盘，手动重启后照样能用 `tools/pull_log.sh` 拉回来。`menu.sh` 第 1 项就是这个模式。
 
+## 开机菜单（不用电脑也能选 iOS / 安卓，2026-10-29 起）
+
+移植自上游 `ShueiTsuki/data-a-live/bootmgr`，源码在 `work-bootmgr/`（`build-pudding.sh` 是
+pudding 版打包脚本）。
+
+**做了什么**：`boot_a` 现在不只是安卓内核，而是一段菜单程序 + 2 MiB 处的原装安卓内核 +
+后面的 iOS 槽位（整个 96 MiB 分区镜像，sha256 `06dbccf1…`，原装 `boot_a` 备份 `dbf0c13e…`）。
+
+**开机时**：正常开机时屏幕下方出现 `Volume up  iOS  5` 倒数 5 秒。
+- 这 5 秒内按**音量上** → 从槽位启动 iOS（**没有时间窗口**，不会自己回安卓，长按电源回安卓）；
+- 不按 → 原样进安卓（菜单把原装内核交出去，和原装开机一样）；
+- 充电器/静默等其它开机模式 → 直接进安卓，不显示这行。
+
+**换 iOS（菜单和安卓都不动）**：
+
+```bash
+bash tools/bootmenu_slot.sh            # 只检查
+bash tools/bootmenu_slot.sh --yes      # 重造 loader（窗口=0）+ 写槽位 + 读回核对
+# 或：bash menu.sh 第 8 项
+```
+
+它做三件事：读手机上三个 pinned 文件的**当前** extents → 用它们重造 loader（payload 的 ADT 里
+就带着这些 extents）→ `slot.py` 打槽位包 → 手机端 helper **只写槽位那一段**，写完读回核对，
+槽位以外的字节必须没变。
+
+**必须记住的一条规则**：**任何改动 pinned 根镜像的操作（`restore_root.sh`、手工编辑后推回）之后，
+都要重新跑一次 `tools/bootmenu_slot.sh --yes`。** 槽位里记着建包时三个文件的 extents 指纹；extents
+一变，旧槽位的 iOS 会读到/写到别的块上 —— 那不只是一个"进不去"的问题，是**会写坏安卓数据**。
+（上游用 `bootmgr/guard/` 那个 Magisk 模块在开机时核对指纹并自动把槽位 `armed` 清 0；我们还没装，
+所以现在靠这条纪律。）
+
+**回滚**（菜单有问题、安卓起不来时）：音量下+电源 进 fastboot，然后
+
+```bash
+fastboot flash boot_a backup/pudding-stock/boot_a.img   # sha256 dbf0c13e…，原装
+```
+
+**只进内存地试菜单**（不写任何分区）：
+
+```bash
+# 调试版：任何开机模式都显示调试数字 + 倒数 9 秒
+wsl -d Ubuntu2404 -e bash -lc "cd /mnt/c/Users/叶晨安/Desktop/Apple/work-bootmgr && bash build-pudding.sh --slot-from ../../boot-slot/loader-boot.img --any-mode --wait-ms 9000"
+fastboot boot work-bootmgr/out/boot-menu.img
+```
+
+**移植时核对过的设备条件**（都是必须对上的）：
+- 音量上 = TLMM GPIO 101（`0x0f165000`，低有效），和我们 `fuxi_keys.c` 里的常量一致；
+- 帧缓冲 `0xfc800000`、1220×2656、stride 4880；
+- 正常开机的 bootargs 里有 `bootmonitor.bootmode=normal` / `mca_log.charge_boot_mode=0` /
+  `silent_boot.mode=nonsilent`（菜单用它判断"是不是普通开机"）；
+- `/chosen/linux,initrd-start|end` 是 8 字节属性（菜单要拿它们确认不与内核区重叠）；
+- 我们这台 **A 槽在用、B 槽全 0**，所以菜单只能写 `boot_a`（上游那台写的是 `boot_b`）。
+
 ## 现在的两个死结（按优先级）
 
 ### A. Setup 为什么没被跳过（挡在锁屏前的最后一道）

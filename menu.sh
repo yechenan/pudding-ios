@@ -103,8 +103,7 @@ PY
 }
 
 build_only() {
-	local tag k w extra tmp
-	tag="img-$(date +%m%d-%H%M%S)"
+	local tag k w extra tmp	tag="img-$(date +%m%d-%H%M%S)"
 	k=$(newest_kernel)
 	printf '内核 [默认 %s]: ' "$k"; read -r tmp; [ -n "${tmp:-}" ] && k="relink/kernel-$tmp"
 	printf '额外参数 [默认 %s]: ' "$DEF_EXTRA"; read -r extra; extra=${extra:-$DEF_EXTRA}
@@ -144,6 +143,15 @@ push_docs() {
 		--repo yechenan/pudding-ios --dir pudding-standalone --branch main --message "$msg" 2>&1 | tail -3
 }
 
+slot_update() {
+	echo "== 把当前内核 + 当前 extents 做成新的 iOS 槽位，写进开机菜单（只动槽位）"
+	echo "   改过镜像（restore_root / 手工编辑）之后必须做一次，否则菜单会因为指纹不符而拒绝进 iOS。"
+	printf '内核 [默认 %s]: ' "$(newest_kernel)"; read -r k
+	k=${k:+relink/kernel-$k}
+	printf '额外参数（回车=无）: '; read -r x
+	bash tools/bootmenu_slot.sh ${k:+--kernel "${k#relink/kernel-}"} ${x:+--args "$x"} --yes
+}
+
 while :; do
 	echo
 	echo "======== pudding 菜单 ========"
@@ -155,7 +163,8 @@ while :; do
 	echo " 5) 拉取上一次 iOS 日志 + 缩略图"
 	echo " 6) 只造镜像，不启动"
 	echo " 7) 恢复镜像到手机（restore_root.sh）"
-	echo " 8) 推文档/补丁到 GitHub"
+	echo " 8) 更新开机菜单里的 iOS 槽位（改过镜像后必做）"
+	echo " 9) 推文档/补丁到 GitHub"
 	echo " 0) 退出"
 	printf '选择: '; read -r c
 	case "${c:-}" in
@@ -169,7 +178,8 @@ while :; do
 	5) pull_log ;;
 	6) build_only ;;
 	7) restore ;;
-	8) push_docs ;;
+	8) slot_update ;;
+	9) push_docs ;;
 	0) exit 0 ;;
 	*) echo "?" ;;
 	esac
