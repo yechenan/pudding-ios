@@ -945,3 +945,32 @@ sweetfb_fill=1 sweetnoexec=bluetoothd,fairplayd.H2`，以及 `tools/iosroot_diff
 两轮都是 `display on` ~48 s、最后 present 70–75 s、屏幕从 132 s 起全黑、`display off` 105/196 s。
 界面确实起来了（启动从 14 分钟降到 1 分钟），但**我们没有在它亮着的时候截到图**。
 下一轮把窗口压到 140 s、缩略图每 10 s 一张、帧转储放在 120 s，专门抓这个瞬间。
+
+### 09:00 现在的系统状态：能交互，但卡在 Setup 的 Wi-Fi 一步
+
+用「不恢复镜像 + 短窗口」把一轮压到 **3–5 分钟**之后，可以直接把系统当成一台要人点的 iPhone 来操作。
+新加的内核 `0255` 手势注入（`pandora_gesture="T:1:x,y;T:2:x0,y0,x1,y1;..."`，1=点击、2=滑动，
+坐标是呈现出来的 1125×2436）已经能一路点下去：
+
+| 轮次 | 注入 | 屏幕变成 |
+|---|---|---|
+| run13 | 无 | Setup 的 hello（"哈囉 / 向上滑动来打开"） |
+| run14 | 上滑 | **Software Update Complete / Continue**（白底蓝按钮，系统真的在响应触摸注入） |
+| run15 | 上滑 + 点 Continue | **Choose a Wi-Fi Network**（只有一个 "Connect to Mac or PC"） |
+| run16 | `sweetnoexec=Setup` | **卡在苹果 logo**，屏 4 帧就不动了 —— 说明 SpringBoard 在等 Setup，不能简单屏蔽 |
+| run17 | 上滑 + Continue + 点 "Connect to Mac or PC" | 还是 Wi-Fi 那一屏（那个按钮点不动，USB 那条路要真 USB 驱动） |
+
+结论：**Setup 必须走完**，而它现在只有"Wi-Fi"和"连接 Mac/PC"两条路，我们两个都没有：
+内核的网络栈只有 lo0/utun，没有 Wi-Fi 驱动，也没有 USB 数据功能。
+
+### 找不到的另一个东西：`/private/var/preferences/SystemConfiguration/preferences.plist`
+
+整个目录不存在（只有 `Logging/`）。真机上这个文件由 configd 首次开机生成，里面是网络服务
+（接口、IP、代理）。两件事都指向它：
+
+- `mobileactivationd` 一启动就崩在 `copyReverseProxyDictionary`（读代理设置的函数）——
+  没有 SystemConfiguration 存储时它拿到的可能是 NULL；
+- Setup 的网络/激活判断也读同一套东西。
+
+run18 = 手工补一份最小 `preferences.plist`（一个 "USB Ethernet" 服务、192.168.7.2）+ **把真
+mobileactivationd 放回去**（`PD_KEEP_MAD=1`），看 mad 会不会因此不崩、Setup 会不会跳过。
