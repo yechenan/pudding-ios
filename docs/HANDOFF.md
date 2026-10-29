@@ -25,12 +25,22 @@
 ## 常用命令（照抄就能跑）
 
 ```bash
+# 0) 交互菜单（推荐入口）：选安卓 / iOS、有没有时间窗口、拉日志、恢复镜像、推文档
+bash menu.sh
+
 # 1) 造一轮启动镜像（手机必须在安卓、adb 可见；会读 pinned 文件的 extents）
-bash tools/prepare_run.sh relink/kernel-0262 boot-runNN 400 \
-  "pandora_fbdump=20 pandora_thumbs_start=50 pandora_thumbs_every=10 pandora_gesture=90:2:562,2400,562,1100"
+#    第三个参数是窗口秒数；写 0 就是"不自动回安卓"（手机停在 iOS 直到长按电源）
+bash tools/prepare_run.sh relink/kernel-0262 boot-runNN 0 \
+  "pandora_thumbs_start=120 pandora_thumbs_every=60"
 
 # 2) 跑一轮（自动 fastboot boot → 等回安卓 → 拉日志 → 解码 + 出图）
 bash tools/run_boot.sh boot-runNN/loader-boot.img runNN 400
+
+# 2b) 手动流程：只拉上一轮的日志（手机手动重启回安卓之后）
+bash tools/pull_log.sh NAME
+
+# 2c) 把手机上的 pinned 镜像拉回主机（保住 lsd 建好的 LaunchServices 库，约 10 分钟）
+bash tools/pull_root.sh
 
 # 3) 只有需要干净基线时才恢复镜像（约 5 分钟，且下一次开机要 14 分钟重建 lsd 库）
 bash tools/restore_root.sh [镜像路径]
@@ -40,13 +50,30 @@ GITHUB_TOKEN=$(tr -d '\r\n' < .gh_token) python tools/gh_push.py \
   --repo yechenan/pudding-ios --dir pudding-standalone --branch main --message "..."
 ```
 
-## 必须知道的 20 个坑（每条都真实踩过）
+## 手动调试的工作方式（2026-10-29 起）
+
+`bash menu.sh` 是本机入口：菜单第 1 项**不设时间窗口**（不传 `pandora_reboot_after`），
+iOS 会一直跑，屏幕上看到什么就停在哪；要回安卓就长按电源 ~10 秒。
+内核每秒把日志写进 pinned 的 `ioslog.img`，所以**手动重启也不丢日志**——回安卓后菜单第 5 项
+（或 `tools/pull_log.sh NAME`）能把这一轮的日志和缩略图拉出来。
+
+要点：
+
+- 无窗口的轮次没有"自动回安卓"，所以**不要**再用 `tools/run_boot.sh` 等它——
+  它在等 `sys.boot_completed`，会一直等下去。
+- 造镜像仍然必须在**安卓**状态（菜单会检查），因为 `prepare_run.sh` 要 `pinfile extents`。
+- 一轮 iOS 不重启就不会自己结束；改内核/参数前先想清楚这轮要看什么。
+
+
+## 必须知道的 22 个坑（每条都真实踩过）
 
 ### 启动 / 镜像
 
 1. **第一次开机 14 分钟不是挂死**。SpringBoard 在等 `lsd` 重建 LaunchServices 数据库
    （`__LAUNCH_SERVICES_IS_RESEEDING_ITS_DATABASE_AND_MAY_BLOCK__`），上游说约 25 分钟。
-   同一个镜像**第二次起只要 ~70 秒**。所以：不要每轮都恢复镜像，恢复了就要等 14 分钟。
+   同一个镜像**第二次起只要 ~70 秒**。实测：run37 首次 present 在 **835.3 s**，run38 只要 **59.1 s**。
+   所以：不要每轮都恢复镜像，恢复了就要等 14 分钟。**任何"看 UI 出不出来"的轮次窗口必须 ≥1500 s**，
+   否则结论全是"被自己掐死的"。
 2. **恢复镜像会丢掉运行时创建的目录**。典型：`/private/var/keybags` 是 fw pack 在运行时建的；
    如果从本地镜像重写回去，这个目录就没了，下一次开机会在 12 秒时
    `FATAL KEYBAG ERROR: kb_load → REBOOTING INTO RECOVERY MODE`。恢复后先确认：
@@ -101,6 +128,12 @@ GITHUB_TOKEN=$(tr -d '\r\n' < .gh_token) python tools/gh_push.py \
     `pandora_fbdump_at` 定时转储）只能靠 CI 的 .o 重链接，暂时用不上。
 20. **写 C 代码时别用 Python heredoc 拼 `\n`**：会写成真换行把字符串切断
     （`printf("... <换行> ")`），编译报 "expected expression"。用 edit 工具写带转义的字符串。
+21. **`pandora_fbdump_at=SECS` 会把整轮打死**（kernel-0262 实测）。到点后 `sweet_fb_dump_now()`
+    先要一块 12.9 MB 的内核缓冲，分配失败 → `kmem_alloc(...) failed with 3` → 内核重启。
+    run39（300 s）死在 300.175 s，run42/run43（600 s）死在 600.187 s。
+    **不要再用这条参数**；要看画面用 `pandora_thumbs_*`，要全帧就等以后把 dump 的内存改成预分配。
+22. **`pandora_reboot_after` 不传 = 不自动回安卓**。手机停在 iOS，直到长按电源 ~10 秒；
+    日志每秒落盘，手动重启后照样能用 `tools/pull_log.sh` 拉回来。`menu.sh` 第 1 项就是这个模式。
 
 ## 现在的两个死结（按优先级）
 
@@ -108,14 +141,26 @@ GITHUB_TOKEN=$(tr -d '\r\n' < .gh_token) python tools/gh_push.py \
 
 镜像里已经有 `com.apple.purplebuddy` 的
 `SetupDone=true / SetupFinishedAllSteps=true / SetupVersion=11 / daemonizeNeedsToRun=false`
-（`pandora_cat` 在运行中读出来也是 `true`，十六进制 `09`），**但 Setup 照样启动**。
-上游用同样的偏好就跳过了，差别还没找到。已知的候选：
+（`pandora_cat` 在运行中读出来也是 `true`，十六进制 `09`），**但 Setup 照样启动**
+（run38：SpringBoard 59.1 s present 锁屏，59.15 s `exec Setup`）。
 
-- 我们的镜像不是他们 `mkiosroot.sh + fuxi-stage-root.py + sweet-root-tweaks.py` 的产物，
-  `/private/var` 是手工补的骨架，可能缺他们那套 Data 卷内容；
-- 他们的 tweaks 版本（`ios-fuxi/tools/sweet-root-tweaks.py`，36 KB）比我们用的
-  ios-sweet 版（6 KB）多很多项，Setup 那一段可能还有别的键；
-- 值得试：把他们的 `sweet-root-tweaks.py` 里的 Setup 段原样抄过来重打镜像。
+2026-10-29 已排除的：
+
+- **"抄上游 Setup 段"是空操作**：上游 `ios-fuxi/tools/sweet-root-tweaks.py` 的 Setup 段与我们
+  `tools/root_tweaks.py` **逐键相同**（5 个 plist、`/private/var/mobile/Library/Preferences/`、
+  501:501 0600、binary plist），从镜像里读回来的值也对；
+- **启动参数不是原因**：上游 `tools/ios_test.sh` 的参数与 run40/41 完全相同；
+- **补丁序列不是原因**：我们停在 0262，上游 0263–0295 全是亮度/音频/oslog/pathlog/installer-rename，
+  没有一条与 Setup 相关（他们 0262 时代就进桌面了）。
+
+剩下的真实差异（下一步验证）：
+
+- **他们的 `mobileactivationd` 是真 job（有 MachServices），我们桩成 `/usr/bin/true` 且 0 个
+  MachServices**。他们的结论是激活走 ADT 安全状态 + 本地 Hactivation。要验证"mad 不在"是否正是
+  SpringBoard 判定要跑 Setup 的原因。
+- 想直接看判定理由：给 `com.apple.SpringBoard` 的 launchd job 加 `OS_ACTIVITY_DT_MODE=YES`
+  （上游 `sweet-root-tweaks.py --oslog` 的做法），os_log 会经 `sweetnull` 进内核日志。
+  注意这会走一次镜像改写 + 推回（≈一次 835 s 的 lsd 重建）。
 
 ### B. `mobileactivationd` 一启动就崩（激活）
 
