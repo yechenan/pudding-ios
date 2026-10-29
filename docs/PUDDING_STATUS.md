@@ -1207,3 +1207,51 @@ run44（正在跑）= 同一镜像 + `pandora_thumbs_start=120 pandora_thumbs_ev
 - 上游 0001–0295 的补丁序列就是我们的来源（我们停在 0262）；0263–0295 全是亮度/音频/oslog/pathlog/
   installer-rename，**没有一条与 Setup 相关**——他们进桌面用的内核能力我们都有，差别只能在
   镜像内容 / 启动参数 / 激活状态三者里。
+
+## 2026-10-29 17:00 找到"进不了 UI"的真正根因：根卷是**非日志式且脏**，不是写过滤器
+
+用户按音量上从开机菜单进 iOS，跑了 16 分钟，屏幕上是滚动的内核文字。拉回日志（`out/ioslog-menurun1.txt`，0→994 s）：
+
+```
+[ 0.186] hfs_mounthfsplus: SWEET: mounting dirty non-journaled root read-write
+[12.385] hfs_mark_inconsistent: Runtime corruption detected on iOSRoot ...   ×303（每 100 秒 ~30 条，稳定）
+[12.390] CRASH containermanager[62] sig 5 ...                                ×404（每 100 秒 ~40 次）
+12.2 s   exec SpringBoard      但 |SpringBoard| 0 行 → 从来没 present
+         exec Setup 0 次       → 连 Setup 都没走到
+```
+
+`SWEET UFS: refusing write` = **0 次** —— 所以不是写过滤器（`fx_write_allowed`）的问题。
+
+**真因**：卷属性被改过。`ios-root.orig.img`（原始）是 `0x80002100`（**journaled**），
+我们这份是 `0x80000100`（**writable 但 journaled 位被清**）——就是 HANDOFF 坑 #4 那个
+"为了强制 rw 清卷属性"的后遗症。没有日志可回放，每次硬复位后卷都是脏的；内核的 SWEET patch
+硬把脏卷挂成可写，于是 HFS 对每次目录写都判"运行期损坏"，`containermanagerd` 一启动就断言崩，
+容器建不出来 → 系统永远走不到 SpringBoard。
+
+**处理**：把干净的宿主镜像推回手机（`restore_root.sh`，`pinfile rawhash` 与写入值逐字节一致
+`e12329f3…`），并用**无 `-v` + 苹果 logo** 的槽位重跑一轮。
+
+结果（`out/ioslog-menuquiet1.txt`，0→1011 s）：
+
+| 指标 | 值 |
+|---|---|
+| `hfs_mark_inconsistent` | **0**（对照上面 303） |
+| `containermanager` | 6 行（对照 404 次崩溃） |
+| `exec SpringBoard` | 12.182 s |
+| 首次 present（CoverSheet） | **835.254 s** ← lsd 建表，和 run37 一致 |
+| `exec Setup` | **835.291 s**（present 后 37 ms，SpringBoard 自己拉起） |
+| 实际 present 帧 | 847.204 s / 852.445 s，600 帧、动画期 115 fps |
+| 熄屏 | ~974 s（没有任何输入） |
+
+用户拍到的屏幕：黑色背景 + 手写体 `hola` + 底部 `Desliza hacia arriba para abrir` + 右下 ⓘ。
+`para abrir`（"上滑打开"）是**锁屏**的措辞（Setup 自己会是 `para empezar/continuar`），所以
+**SpringBoard 已经出锁屏，Setup 是在它后面刚被拉起来**。
+
+正在跑（`boot-gest`）：干净镜像 + 无 `-v` + 苹果 logo + `pandora_gesture` 在 845 s / 900 s 上滑、
+960 s 点击 + 每 20 秒缩略图，用来判定"上滑之后是桌面还是 Setup 页"。
+
+### 还欠的一件事：日志式卷
+
+现在每轮 iOS 启动前都要 `restore_root.sh`（否则脏卷 → 上面那个死循环），代价 12 分钟。
+根治办法是把内容搬进一个 `mkfs.hfsplus -s -J` 的新卷（tar-out/tar-in），或改内核在挂载脏根卷时
+把"脏"当陈旧状态清掉（需要 CI 重编）。
