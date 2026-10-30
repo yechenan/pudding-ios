@@ -1656,3 +1656,34 @@ Read-only file system`），要 tar 进新卷必须先清日志位；而且 189k
    或 `PandoraAudio.cpp` 里 `"output ports"` / `"port type"` 之类的属性是否与 iPhone X 一致；
 3. 对照上游 0290/0291/0296 的日志判据（他们 `aud13`/`aud19` 的 unified log）看是否有
    "Culling route connection because ringer switch is off" 之类的话。
+
+## 2026-10-30 09:05 a9（`pandora_audio_tt=1`）：Thunderbolt 模式也没拿到路由
+
+- 仍然 12 次 `not routed within 5 s`；
+- 同样出现 28 s 前后那波异常 IO：`bufs 35295, read 35106 cmds 2977928 KiB, device 2469 ms (8%)`，
+  与 `Failed to handle the new encryption key. Error 0xe00002d8` 相邻出现（a8 也有）。这个 2.9 GB
+  的读放大值得单独查——像是某条 IO 路径在空转。
+
+**当天音频的完整结论（到这里可以交接）**
+
+| 环节 | 状态 |
+|---|---|
+| IOAudio2 设备（Speaker / Hawking / Codec 三实例，48 kHz s32 2ch） | ✅ 注册成功 |
+| ADSP 固件加载 / `auth_and_reset` | ✅ 成功 |
+| 两颗 CS35L43 放大器 DSP 固件（wmfw + B/T tuning） | ✅ `loaded`（把 `/odm/firmware` 的文件加进固件包之后） |
+| CoreAudio → 我们的设备写数据 | ✅ `PANDORA IO … write 35 cmds 236 KiB` |
+| **iOS 把内置扬声器选成输出（路由）** | ❌ 从未发生（`set stream active` 从没来） |
+
+上游自己的注释已经说明这条路走不通的原因：*"内置 UID 'Speaker' 时没有任何 category 能拿到
+通往 speaker 端口的路由，iPhone X 的路由数据库要的不止这一个设备"*。他们最终靠
+0292–0307 那一串继续改设备模型/路由时序才做到 audio live——我们只搬了 0313 的**最终源代码**，
+但缺了那些**运行时状态**（端口/控制/属性时序），所以卡在最后一步。
+
+**下一步建议（给下一次会话）**
+1. 逐条读上游 0292–0296、0300–0306 的 diff，把每一处 `setProperty`/控制项/时序与我们
+   `work-audio/up/PandoraAudio.cpp` 对照（我们的文件来自 0313，理论上都有，但要确认没有
+   因为需要别的补丁配合才生效的部分）；
+2. 重点看 `output ports` / mute 控制所在的 element（注释说 element 3 给 receiver 端口、
+   **element 4 才给 speaker 端口**）——如果 Speaker 设备缺 element 4 的控制，VirtualAudio
+   就不会生成 speaker 端口，这可以解释"三个设备都在、就是没路由"；
+3. 那个 2.9 GB 读放大单独查（可能是 Hawking/输入环在空转）。
