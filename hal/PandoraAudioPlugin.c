@@ -654,8 +654,8 @@ static Boolean STDMETHODCALLTYPE
 pa_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pid_t inClientProcessID,
     const AudioObjectPropertyAddress *inAddress)
 {
-	UInt32 size = sizeof(dummy);
 	char dummy[512];
+	UInt32 size = sizeof(dummy);
 	return pa_object_data(&size, dummy, inObjectID, inAddress) == noErr;
 }
 
@@ -683,8 +683,8 @@ pa_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver, AudioObjectID inObje
 	if (outDataSize == NULL) {
 		return kAudioHardwareIllegalOperationError;
 	}
-	UInt32 size = sizeof(dummy);
 	static char dummy[4096];
+	UInt32 size = sizeof(dummy);
 	OSStatus err = pa_object_data(&size, dummy, inObjectID, inAddress);
 	pa_log_prop("size", inObjectID, inAddress, err);
 	if (err != noErr) {
