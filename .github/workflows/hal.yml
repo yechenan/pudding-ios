@@ -1,0 +1,34 @@
+name: hal
+
+# Builds PandoraAudio.driver: the AudioServerPlugIn that replaces VirtualAudio for our IOAudio2 device.
+# Small and fast (no xnu build); the artifact is a .driver bundle for arm64 iOS 16.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'hal/**'
+      - '.github/workflows/hal.yml'
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the plug-in
+        run: bash hal/build.sh
+
+      - name: Package
+        run: |
+          mkdir -p out
+          (cd out && zip -qry pandora-hal.zip PandoraAudio.driver)
+          ls -l out/pandora-hal.zip
+          shasum -a 256 out/pandora-hal.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pandora-hal
+          path: out/pandora-hal.zip
+          retention-days: 14
