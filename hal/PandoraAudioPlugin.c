@@ -191,6 +191,23 @@ pa_cfstr(const char *s)
 
 /* ------------------------------------------------------------------ properties */
 
+/* The host walks the property space before it creates devices; log the first few so a silent plug-in is
+ * visible in the kernel log ("|mediaserverd| PANDORA HAL: prop ..."). */
+static unsigned g_prop_logs;
+
+static void
+pa_log_prop(const char *what, AudioObjectID id, const AudioObjectPropertyAddress *a, OSStatus err)
+{
+	if (g_prop_logs >= 40) {
+		return;
+	}
+	g_prop_logs++;
+	char sel[5] = { (char)(a->mSelector >> 24), (char)(a->mSelector >> 16), (char)(a->mSelector >> 8),
+		(char)a->mSelector, 0 };
+	char sc[5] = { (char)(a->mScope >> 24), (char)(a->mScope >> 16), (char)(a->mScope >> 8), (char)a->mScope, 0 };
+	pa_log("prop %s id %u %s/%s elem %u -> %d", what, (unsigned)id, sel, sc, (unsigned)a->mElement, (int)err);
+}
+
 static OSStatus
 pa_plugin_data(UInt32 *size, void *out, const AudioObjectPropertyAddress *a)
 {
@@ -637,7 +654,7 @@ static Boolean STDMETHODCALLTYPE
 pa_HasProperty(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID, pid_t inClientProcessID,
     const AudioObjectPropertyAddress *inAddress)
 {
-	UInt32 size = 0;
+	UInt32 size = sizeof(dummy);
 	char dummy[512];
 	return pa_object_data(&size, dummy, inObjectID, inAddress) == noErr;
 }
@@ -666,9 +683,10 @@ pa_GetPropertyDataSize(AudioServerPlugInDriverRef inDriver, AudioObjectID inObje
 	if (outDataSize == NULL) {
 		return kAudioHardwareIllegalOperationError;
 	}
-	UInt32 size = 0xffff;
-	char dummy[512];
+	UInt32 size = sizeof(dummy);
+	static char dummy[4096];
 	OSStatus err = pa_object_data(&size, dummy, inObjectID, inAddress);
+	pa_log_prop("size", inObjectID, inAddress, err);
 	if (err != noErr) {
 		return err;
 	}
@@ -686,6 +704,7 @@ pa_GetPropertyData(AudioServerPlugInDriverRef inDriver, AudioObjectID inObjectID
 	}
 	UInt32 size = inDataSize;
 	OSStatus err = pa_object_data(&size, outData, inObjectID, inAddress);
+	pa_log_prop("get", inObjectID, inAddress, err);
 	if (err == noErr) {
 		*outDataSize = size;
 	}
