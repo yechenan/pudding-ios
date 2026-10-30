@@ -2503,7 +2503,7 @@
  /* Write NW bytes (if any) to ADDR, then with a repeated start read NR bytes (if any). 0 or an errno. */
 --- /dev/null
 +++ b/iokit/Kernel/arm/PandoraAudio.cpp
-@@ -0,0 +1,1067 @@
+@@ -0,0 +1,1077 @@
 +/*
 + * The speaker as iOS's built-in audio device, step 1 (0281): our own IOAudio2Device and IOAudio2DeviceUserClient.
 + * Apple's IOAudio2Family is not prelinked here (tools/mkprelink.py keeps AMFI and its libraries only), so the class
@@ -3107,6 +3107,16 @@
 +	setProperty("clock domain", PA_4CC('p', 'a', 'n', 'd'), 32);
 +	setProperty("output streams", outs);
 +	setProperty("input streams", ins);
++	/* 2026-10-30: VirtualAudio builds its ports from the device's controls: a mute control on output
++	 * element 4 makes the speaker port (element 3 gives the built-in receiver; see the note above). */
++	if (!hawking_) {
++		OSDictionary *spk_mute = pa_control(3, PA_4CC('t', 'o', 'g', 'l'), PA_4CC('m', 'u', 't', 'e'),
++		    PA_4CC('o', 'u', 't', 'p'), 4, 0);
++		if (spk_mute != nullptr) {
++			controls->setObject(spk_mute);
++			OSSafeReleaseNULL(spk_mute);
++		}
++	}
 +	setProperty("controls", controls);
 +	OSSafeReleaseNULL(stream);
 +	OSSafeReleaseNULL(outs);
