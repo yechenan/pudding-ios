@@ -1,0 +1,31 @@
+name: sink
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Sources
+        run: git clone --depth 1 https://github.com/ShueiTSuki/data-a-live /tmp/up
+
+      - name: Build for iOS 16 arm64
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          mkdir -p out
+          clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall \
+            -framework CoreFoundation -o out/pandora_sink /tmp/up/tools/sink/pandora_sink.c
+          clang -target arm64-apple-ios16.0 -isysroot "$SDK" -O2 -Wall \
+            -framework CoreFoundation -o out/pandora_fairplayd /tmp/up/tools/fairplay/pandora_fairplayd.c
+          codesign -s - out/pandora_sink out/pandora_fairplayd || true
+          file out/*
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sink
+          path: out/
+          retention-days: 7
