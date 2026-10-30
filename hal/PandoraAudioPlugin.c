@@ -142,6 +142,11 @@ typedef struct {
 
 static pa_driver_t g_driver;
 
+static UInt32 g_refs = 1;
+
+static AudioServerPlugInDriverInterface g_iface;          /* the table itself is defined near the end */
+static AudioServerPlugInDriverInterface *g_iface_ptr = &g_iface;
+
 static ULONG STDMETHODCALLTYPE pa_AddRef(void *inDriver);
 static ULONG STDMETHODCALLTYPE pa_Release(void *inDriver);
 
@@ -523,15 +528,15 @@ pa_kernel_start(void)
 static HRESULT STDMETHODCALLTYPE
 pa_QueryInterface(void *inDriver, REFIID inUUID, LPVOID *outInterface)
 {
-	pa_driver_t *d = (pa_driver_t *)inDriver;
+	(void)inDriver;
 	if (outInterface == NULL) {
 		return EINVAL;
 	}
 	CFUUIDRef requested = CFUUIDCreateFromUUIDBytes(kCFAllocatorDefault, inUUID);
 	if (requested != NULL && CFEqual(requested, kAudioServerPlugInTypeUUID)) {
 		CFRelease(requested);
-		*outInterface = d;
-		pa_AddRef(d);
+		*outInterface = (void *)&g_iface;                 /* the interface pointer, as the host expects */
+		pa_AddRef(NULL);
 		return S_OK;
 	}
 	if (requested != NULL) {
@@ -544,24 +549,23 @@ pa_QueryInterface(void *inDriver, REFIID inUUID, LPVOID *outInterface)
 static ULONG STDMETHODCALLTYPE
 pa_AddRef(void *inDriver)
 {
-	pa_driver_t *d = (pa_driver_t *)inDriver;
-	return __sync_add_and_fetch(&d->refs, 1);
+	(void)inDriver;
+	return __sync_add_and_fetch(&g_refs, 1);
 }
 
 static ULONG STDMETHODCALLTYPE
 pa_Release(void *inDriver)
 {
-	pa_driver_t *d = (pa_driver_t *)inDriver;
-	UInt32 left = __sync_sub_and_fetch(&d->refs, 1);
-	return left;
+	(void)inDriver;
+	return __sync_sub_and_fetch(&g_refs, 1);
 }
 
 static OSStatus STDMETHODCALLTYPE
 pa_Initialize(AudioServerPlugInDriverRef inDriver, AudioServerPlugInHostRef inHost)
 {
-	pa_driver_t *d = (pa_driver_t *)inDriver;
-	d->host = inHost;
-	d->initialized = true;
+	(void)inDriver;
+	g_driver.host = inHost;
+	g_driver.initialized = true;
 	pa_log("plugin initialized (host %p)", (void *)inHost);
 	return noErr;
 }
@@ -830,5 +834,5 @@ PandoraAudio_Create(CFAllocatorRef inAllocator, CFUUIDRef inRequestedTypeUUID)
 	g_driver.io_buffer_frames = 512;
 	pthread_mutex_init(&g_driver.lock, NULL);
 	pa_log("factory: driver created");
-	return &g_driver;
+	return &g_iface_ptr;                                      /* AudioServerPlugInDriverInterface** */
 }
