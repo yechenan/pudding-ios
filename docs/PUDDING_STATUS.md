@@ -1687,3 +1687,88 @@ Read-only file system`），要 tar 进新卷必须先清日志位；而且 189k
    **element 4 才给 speaker 端口**）——如果 Speaker 设备缺 element 4 的控制，VirtualAudio
    就不会生成 speaker 端口，这可以解释"三个设备都在、就是没路由"；
 3. 那个 2.9 GB 读放大单独查（可能是 Hawking/输入环在空转）。
+## 2026-10-30 14:45 音频：找到了真正的两个断点（HAL 没加载 / ADSP 没启动）
+
+今天四轮（h1–h5）把“为什么没声音”从“路由不给”细化到两个具体断点，并且都拿到了证据。
+
+### 断点一：ADSP 从来没启动过（已修）
+
+hi2 的日志：
+
+```
+[20.171] PANDORA ADSP: no boot-arg pandora_slot=a|b: the firmware partition is not read
+[20.172] PANDORA ADSP: adsp_dtb.mdt missing in the pack
+[20.172] PANDORA ADSP: DTB image failed 2
+```
+
+固件包里没有 ADSP 固件，也没传 `pandora_slot`，所以 DSP 从未启动——**播放图、TDM、功放都没机会跑**。之前日志里的
+`pas 13 auth_and_reset -> a0 0 a1 0` 只是 zap 分片，不是 ADSP，容易被误读成“ADSP 成功了”。
+
+加 `pandora_slot=a`（安卓 `ro.boot.slot_suffix=_a`，读 `modem_a` 这个 FAT16 分区）后 h3：
+
+```
+PANDORA ADSP: modem_a: LUN 4 blocks 0x1686+0xa000, FAT mount -> 0 (FAT16, 16384-byte clusters)
+PANDORA ADSP: slave-kernel 0x2 after 619 ms → ready after 620 ms
+PANDORA ADSP: channel adsp_apps up after 658 ms; APM ready 1009 ms after the channel came up
+```
+
+### 断点二：扬声器播放图缺 `spkgraph.bin`（已修）
+
+`pandora_adsp.c` 按名字从固件包里取 `spkgraph.bin`/`rcvgraph.bin`。用手机自己的 ACDB 现场生成后
+（`tools/spk_graph.py`：开图 2776 B、校准 7128 B/168 参数、TDM 48 B；听筒图 2680/2168 B），h3 第一次出现：
+
+```
+PANDORA SPK: speaker graph: 4 subgraphs, open 2776 bytes, calibration 7128, TDM 48; 13 commands
+PANDORA SPK: graph open/prepare/start: 全部 status 0
+PANDORA SPK: speaker graph running after 30 ms; live: the graph stays up and plays iOS's speaker output
+PANDORA SPK: live at 20040 ms: 1006 buffers sent, 1002 back (0 with an error), 4 in flight
+```
+
+→ **内核→DSP→TDM→功放整条链第一次真正跑起来**（功放也 `0x40 (B): firmware 0x1820d6 version 7.30.1, 27 algorithms`）。
+没有 `spkgraph.bin` 时驱动只打一行 `no graph`，其它一切看起来都正常——这是最坑的静默失败。
+
+### 断点三：`mediaserverd` 加载 HAL 插件时停在 CarPlayHalogen.driver（已定位，改法待定）
+
+开 `pandora_pathlog=mediaserverd`（上游 0285）后，h3 显示 mediaserverd 从 12.61 s 开始按顺序加载
+`AirPlayHalogen → AppleAOPAudioPlugin → AppleTimeSyncAudioClock → AppleUSBAudio → BTAudioHALPlugin →
+BasebandVoice → CarPlayHalogen`，**到 12.672 s 就再也没有任何插件加载动作**，一直到 1054 s 复位。
+`VirtualAudio.plugin` 一次都没被打开（grep 计数 0）——所以它连“跳过我们”的机会都没有。
+
+h5 用一个诊断性改动验证了这条判断：通过固件包的 `files.txt` 把 `CarPlayHalogen.driver/CarPlayHalogen`
+覆盖成 8 字节垃圾文件（不动镜像，原文件备份在 `work-audio/halrestore/`），结果 **VirtualAudio 被加载了**：
+
+```
+[12.752] PANDORA PATH: mediaserverd stat /Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio
+[12.753] PANDORA PATH: mediaserverd open /Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio
+... Localizable.loctable / en.lproj / Base.lproj / English.lproj
+```
+
+h3 的 VirtualAudio 路径行数 0 → h5 是 19。**结论：我们这份根文件系统里，HAL 插件扫描卡在 CarPlayHalogen，
+VirtualAudio 因此从未被加载。** 真正的修法是查清它为什么在我们拼的根里加载不了（多半缺依赖），而不是长期把它换成垃圾。
+
+### 仍未解决：VirtualAudio 不打开我们的设备 + 一个 spinlock 超时
+
+h5 里 VirtualAudio 加载了，但我们的驱动仍然只有 12 次 `not routed`（到 165 s 结束），没有任何
+`PANDORA AUDIO ... opened by`。并且 638.335 s 出现内核死锁并重启：
+
+```
+Ticket spinlock[0xfffffff007bb4880] timeout after 854336 ticks; cticket: 0x89, nticket: 0x8b,
+waiting for 0x8a, current owner: 0xfffffff62af6ec08 (on CPU 1) @lock_ticket.c:386
+PANDORA: restart type 4, final log flush 0
+```
+
+这条锁的地址可以用 CI 产物里的符号表定位（`out/next/ci/kernel.zip` 里有 dSYM 和 `.exp`），下一次先做这件事。
+
+### 这一轮的操作性结论（都写进 MISTAKES 了）
+
+- **恢复镜像会把 LaunchServices 状态退回去**：`restore_root.sh` 之后再开机，前 30 秒写入量约 250–290 MB（建表），
+  这期间 300 秒的窗口只会看到“进度条一半不动”，任何音频结论都作废。判据：看第一个 `PANDORA IO` 区间的写量。
+- **`PANDORA IO` 是 UFS 块设备统计，不是音频**（`sweet_ufs.c:2251`）。之前文档里“CoreAudio 持续写 236 KiB/30s”是误读。
+- **打开 HAL 之后 backboardd 在 12.5 秒就不再输出、画面不再重绘**，这是 HAL 没加载时的连带现象，不是独立故障。
+
+### 下一步（按顺序）
+
+1. 用 CI 产物的符号表定位 `0xfffffff007bb4880` 这把锁，搞清 638 s 的死锁在哪（很可能是我们的 IOAudio2 用户端路径）。
+2. 查 CarPlayHalogen 为什么在我们的根里加载不了（对比它的依赖是否被 stage 进来），修根而不是长期换垃圾文件。
+3. 修好之后，VirtualAudio + 我们的 Speaker/Hawking 才会真正进入“路由”这个话题（上游的 aud19 判据）。
+4. **把“已建表”的镜像拉回来当基线**（`tools/pull_root.sh`），以后每轮不必再付 835 秒建表。

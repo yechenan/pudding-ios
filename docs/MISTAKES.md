@@ -5,6 +5,13 @@
 
 | # | 错误 | 后果（证据） | 以后的规矩 |
 |---|------|--------------|-----------|
+| 57 | 以为 `OS_ACTIVITY_DT_MODE=YES` 能把 mediaserverd 的 os_log 弄进内核日志 | 整轮只抓到 51 个字符（`{ IOProviderClass = AppleAOPAudioController;}`），VirtualAudio 自己的日志一条没有 | 要看 HAL 到底加载了什么，用 `pandora_pathlog=mediaserverd`（上游 0285，内核里已有）；DT 模式只对 os_activity 类输出有效 |
+| 56 | 没注意根文件系统里 `VirtualAudio.plugin` 被挪进了 `HAL.disabled`（老版 root tweaks 干的） | h1–h4 全在“系统里根本没有音频 HAL”的条件下试 UID / `pandora_audio_tt` / `pandora_audio_now` / element-4 mute，四轮全部无效 | 做音频前先确认 `/Library/Audio/Plug-Ins/HAL` 非空；上游 `docs/AUDIO_SPEAKER.md` §6.2 明确写了 sweet 系镜像要挪回来 |
+| 55 | 固件包里只放功放固件，没放 ACDB 生成的 `spkgraph.bin` / `rcvgraph.bin` / `crus_calr.bin` | 播放图永远起不来（而且驱动只打一行 `PANDORA SPK: ... no graph`），功放也没有本机校准，整轮看起来“全链路正常但没声音” | `--amp-fw` 的包里必须有这三件：`tools/spk_graph.py <ACDB> spkgraph.bin`（另出 receiver 图）+ `/mnt/vendor/persist/audio/crus_calr.bin` |
+| 54 | 不知道要给 loader 传 `pandora_slot=a\|b` | ADSP 从不启动：`no boot-arg pandora_slot` → `adsp_dtb.mdt missing in the pack` → `DTB image failed 2`，而 `pas 13 auth_and_reset -> a0 0` 看起来像成功（那只是 zap 分片） | 固件包里没打 ADSP 镜像时，必须传 `pandora_slot`（安卓 `ro.boot.slot_suffix=_a` → `pandora_slot=a`，读 `modem_a`）；确认 ADSP 看 `SMP2P ... ready` / `channel adsp_apps up` / `APM ready` |
+| 53 | 恢复镜像之后用 300–1500 秒的窗口判断音频 | h1 前 30 秒写入 287 MB（在建表）、h2 只写 13 MB 却仍停在 50%，两轮都没走完启动，音频结论全部作废 | `restore_root.sh` 之后的首次启动要 ≥1800 s，或者先把“已建表”的镜像 `tools/pull_root.sh` 拉回来当基线；判据：第一个 `PANDORA IO` 区间写量 >200 MB 就是在建表 |
+| 52 | 把 `PANDORA IO: ... write 35 cmds 236 KiB` 当成 CoreAudio 在写音频 | `AUDIO_HANDOFF.md` 里“CoreAudio 持续写 236 KiB/30s、device 0%”全是 UFS 块设备统计（`sweet_ufs.c:2251`），把“设备注册了却没数据”这个矛盾掩盖了几轮 | 看到 `PANDORA IO` 先想起它是 UFS 统计；音频要看 `PANDORA AUDIO ... out +N ms: L peak ... rms` |
+| 51 | 只看“进度条卡一半”就推断“建表慢/正常” | 实际是 `mediaserverd` 的 HAL 插件扫描停在 `CarPlayHalogen.driver`（h3：12.672 s 之后再无插件加载，`VirtualAudio.plugin` 路径计数 0；h5 把它覆盖成垃圾后 VirtualAudio 立刻被加载，计数 19） | 判断启动卡在哪用 `pandora_pathlog=mediaserverd`，不要靠屏幕百分比和磁盘 I/O 猜 |
 | 47 | 拿 `/root/rl` 的 CI 对象当基座、再叠上自己从当前源码树编的对象去重链内核 | 三个内核全部早期 panic（0.12–0.46 s），最后一个连一个对象都没换也 panic 在 `@IOPlatform.cpp:289`；而 `IOPlatform.cpp` 在我们源码树里根本不存在 → 对象集来自更新的源码 | **对象集、link.filelist、源码树必须同源**；`ci4/.../xnu.obj`（1129 条）与 `/root/rl`（1130 条）不是同一代，不能混用 |
 | 48 | 用 `ld64.lld` 链内核 | 产物是 `LC_MAIN`，`tools/mkpayload.py` 只认 `LC_UNIXTHREAD`，报 `required argument is not an integer` | 链内核用 `/opt/ld64/bin/aarch64-apple-darwin-ld`，strip 用同目录的 `aarch64-apple-darwin-strip` |
 | 49 | 以为本地编不了 C++ 内核代码 | 实际只是缺 Apple clang 的三个 builtin；stub 掉之后 `PandoraAudio.cpp`/`SweetAMFI.cpp` 都能编 | 先试 `work-audio/stubs.h` 那套，再谈只能走 CI |
