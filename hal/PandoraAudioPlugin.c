@@ -535,14 +535,26 @@ pa_QueryInterface(void *inDriver, REFIID inUUID, LPVOID *outInterface)
 	/* Two different UUIDs are in play: kAudioServerPlugInTypeUUID is only the CFPlugIn type declared in
 	 * Info.plist; QueryInterface must answer kAudioServerPlugInDriverInterfaceUUID (the interface this object
 	 * conforms to). Answering the type UUID instead makes the host drop the driver right after the factory. */
-	CFUUIDRef requested = CFUUIDCreateFromUUIDBytes(kCFAllocatorDefault, inUUID);
-	if (requested != NULL && (CFEqual(requested, kAudioServerPlugInDriverInterfaceUUID) ||
-	    CFEqual(requested, kAudioServerPlugInTypeUUID))) {
-		CFRelease(requested);
-		*outInterface = (void *)&g_iface;                 /* the interface pointer, as the host expects */
-		pa_AddRef(NULL);
-		return S_OK;
+	{
+		const unsigned char *b = (const unsigned char *)&inUUID;
+		pa_log("QueryInterface uuid %02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		    b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
 	}
+	CFUUIDRef requested = CFUUIDCreateFromUUIDBytes(kCFAllocatorDefault, inUUID);
+	Boolean known = requested != NULL && (CFEqual(requested, kAudioServerPlugInDriverInterfaceUUID) ||
+	    CFEqual(requested, kAudioServerPlugInTypeUUID));
+	pa_log("QueryInterface: %s -> %s", known ? "known uuid" : "unknown uuid", "S_OK (diagnostic)");
+	if (requested != NULL) {
+		CFRelease(requested);
+	}
+	/* Diagnostic round: answer every UUID and hand back the driver reference the host dereferences,
+	 * so the log shows whether the crash is about the UUID or about the shape of the reference. */
+	{
+		AudioServerPlugInDriverInterface **ref = &g_iface_ptr;
+		*outInterface = (void *)ref;
+	}
+	pa_AddRef(NULL);
+	return S_OK;
 	if (requested != NULL) {
 		CFRelease(requested);
 	}
