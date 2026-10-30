@@ -532,8 +532,12 @@ pa_QueryInterface(void *inDriver, REFIID inUUID, LPVOID *outInterface)
 	if (outInterface == NULL) {
 		return EINVAL;
 	}
+	/* Two different UUIDs are in play: kAudioServerPlugInTypeUUID is only the CFPlugIn type declared in
+	 * Info.plist; QueryInterface must answer kAudioServerPlugInDriverInterfaceUUID (the interface this object
+	 * conforms to). Answering the type UUID instead makes the host drop the driver right after the factory. */
 	CFUUIDRef requested = CFUUIDCreateFromUUIDBytes(kCFAllocatorDefault, inUUID);
-	if (requested != NULL && CFEqual(requested, kAudioServerPlugInTypeUUID)) {
+	if (requested != NULL && (CFEqual(requested, kAudioServerPlugInDriverInterfaceUUID) ||
+	    CFEqual(requested, kAudioServerPlugInTypeUUID))) {
 		CFRelease(requested);
 		*outInterface = (void *)&g_iface;                 /* the interface pointer, as the host expects */
 		pa_AddRef(NULL);
