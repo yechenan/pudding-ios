@@ -1617,3 +1617,26 @@ Read-only file system`），要 tar 进新卷必须先清日志位；而且 189k
 **注意**：`relink/kernel-audio-03` 是本地的实验内核（用上次 CI 的 objects + 3 个 no-op stub 顶住
 `pandora_therm_init`/`pandora_usb_*`），会卡在 logo 且不回安卓——**不要再用它**；
 能用的是 `kernel-audio-04`（CI 同源）。
+
+## 2026-10-30 08:30 a7：放大器 DSP 固件加载成功，但 iOS 仍不选我们做输出路由
+
+**关键改进**：把 `/odm/firmware` 里的 5 个 CS35L43 文件塞进固件包后，两颗放大器从
+"ROM stopped right after reset" 变成 **loaded**：
+
+```
+[11.681] PANDORA AMP: 0x40 loaded: halo 0 0 rst 0 scratch 0 0 0 0 core 0
+[11.681] PANDORA AMP: 0x40 loaded: mpu 3104 0 310c 0 3114 0 lock 0 5608 0 5618 0 wdt c0b00 0
+[15.289] PANDORA AMP: 0x42 loaded: ...
+[15.502] PANDORA AMP: done
+```
+
+（`PANDORA AMP: calibration file not in the pack (0 bytes)` 仍在——`crus_calr.bin` 缺失，属校准数据，
+不影响 DSP 起来。）
+
+**仍未解决**：Speaker 设备反复 `not routed within 5 s`（12 次），`PANDORA IO … device 3 ms (0%)`。
+即：IOAudio2 设备、ADSP、DSP 固件、CoreAudio 的 IO 全都在，但 **iOS 没把内置扬声器选成当前路由**。
+
+**下一步**：读上游 0290–0307（尤其 0293 audio-replug / 0300 audio-receiver-route /
+0301 audio-graph-stays）弄清 "routed" 的判据与如何触发；同时检查是否需要
+`pandora_audio_tt` / `pandora_audio_now` 之类的参数，或要在 `PandoraAudio.cpp` 里
+把 `"device UID"`/默认输出属性按 iOS 16 的 HAL 期望值设置。
