@@ -66,6 +66,7 @@ pa_log(const char *fmt, ...)
 
 /* ------------------------------------------------------------------ IOKit through dlsym */
 
+typedef uint32_t IOOptionBits;              /* IOKit/IOTypes.h, not pulled in here */
 typedef mach_port_t io_object_t;
 typedef io_object_t io_service_t;
 typedef io_object_t io_iterator_t;
@@ -386,7 +387,6 @@ pa_stream_data(UInt32 *size, void *out, const AudioObjectPropertyAddress *a)
 	}
 	case kAudioStreamPropertyVirtualFormat:
 	case kAudioStreamPropertyPhysicalFormat:
-	case kAudioStreamPropertyCurrentFormat:
 		return pa_write_u32(size, out, &fmt, sizeof(fmt));
 	case kAudioStreamPropertyAvailableVirtualFormats:
 	case kAudioStreamPropertyAvailablePhysicalFormats: {
@@ -527,11 +527,15 @@ pa_QueryInterface(void *inDriver, REFIID inUUID, LPVOID *outInterface)
 	if (outInterface == NULL) {
 		return EINVAL;
 	}
-	CFUUIDRef requested = (CFUUIDRef)inUUID;
+	CFUUIDRef requested = CFUUIDCreateFromUUIDBytes(kCFAllocatorDefault, inUUID);
 	if (requested != NULL && CFEqual(requested, kAudioServerPlugInTypeUUID)) {
+		CFRelease(requested);
 		*outInterface = d;
 		pa_AddRef(d);
 		return S_OK;
+	}
+	if (requested != NULL) {
+		CFRelease(requested);
 	}
 	*outInterface = NULL;
 	return E_NOINTERFACE;
