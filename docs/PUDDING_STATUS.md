@@ -1640,3 +1640,19 @@ Read-only file system`），要 tar 进新卷必须先清日志位；而且 189k
 0301 audio-graph-stays）弄清 "routed" 的判据与如何触发；同时检查是否需要
 `pandora_audio_tt` / `pandora_audio_now` 之类的参数，或要在 `PandoraAudio.cpp` 里
 把 `"device UID"`/默认输出属性按 iOS 16 的 HAL 期望值设置。
+
+## 2026-10-30 08:49 a8（`pandora_audio_now=1`）：路由仍未建立，但 IO 模式变了
+
+- 仍然 12 次 `not routed` → **不是静音键时序问题**，`pandora_audio_now=1` 没能让 VirtualAudio 选中我们；
+- 但第一个 30 秒区间出现异常量：`bufs 35276, read 35238 cmds 2979424 KiB, write 389 cmds 2772 KiB;
+  device 2486 ms (8%)` —— 约 2.9 GB 的读取、设备时间 8%，随后回落到 `device 3–6 ms (0%)`。
+  说明 `pandora_audio_now` 让某条路径（ADSP/DSP 图）真的跑起来了，但 iOS 侧的播放路由没跟上，
+  读到的是空数据。
+
+**结论**：问题不在"何时发布设备"，而在 **VirtualAudio 的路由数据库/端口** ——
+它需要把我们的 `Speaker` 端口认成可用输出。下一步方向：
+1. 试 `pandora_audio_delay=40` 排除时序（低优先级，a8 已基本排除）；
+2. 重点查 VirtualAudio 的端口模型：上游有没有 stage 过 `VirtualAudio` 相关 plist，
+   或 `PandoraAudio.cpp` 里 `"output ports"` / `"port type"` 之类的属性是否与 iPhone X 一致；
+3. 对照上游 0290/0291/0296 的日志判据（他们 `aud13`/`aud19` 的 unified log）看是否有
+   "Culling route connection because ringer switch is off" 之类的话。
