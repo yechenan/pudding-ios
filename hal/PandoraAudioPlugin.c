@@ -198,7 +198,7 @@ static unsigned g_prop_logs;
 static void
 pa_log_prop(const char *what, AudioObjectID id, const AudioObjectPropertyAddress *a, OSStatus err)
 {
-	if (g_prop_logs >= 40) {
+	if (g_prop_logs >= 200) {
 		return;
 	}
 	g_prop_logs++;
