@@ -355,6 +355,18 @@ pa_device_data(UInt32 *size, void *out, const AudioObjectPropertyAddress *a)
 		layout.l.mNumberChannelDescriptions = 0;
 		return pa_write_u32(size, out, &layout.l, sizeof(layout.l));
 	}
+	case kAudioDevicePropertyIsHidden: {              /* 'hidn': the model builder bails out when this fails */
+		UInt32 t = 0;
+		return pa_write_u32(size, out, &t, sizeof(t));
+	}
+	case kAudioDevicePropertyRelatedDevices: {        /* 'rel#' */
+		AudioObjectID ids[1] = { kPAObjectDevice };
+		return pa_write_u32(size, out, ids, sizeof(ids));
+	}
+	case kAudioDevicePropertyPreferredChannelsForStereo: {   /* 'dch2' */
+		UInt32 ch[2] = { 1, 2 };
+		return pa_write_u32(size, out, ch, sizeof(ch));
+	}
 	case kAudioObjectPropertyControlList: {
 		*size = 0;
 		return noErr;
