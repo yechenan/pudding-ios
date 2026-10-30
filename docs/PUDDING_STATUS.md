@@ -1772,3 +1772,45 @@ PANDORA: restart type 4, final log flush 0
 2. 查 CarPlayHalogen 为什么在我们的根里加载不了（对比它的依赖是否被 stage 进来），修根而不是长期换垃圾文件。
 3. 修好之后，VirtualAudio + 我们的 Speaker/Hawking 才会真正进入“路由”这个话题（上游的 aud19 判据）。
 4. **把“已建表”的镜像拉回来当基线**（`tools/pull_root.sh`），以后每轮不必再付 835 秒建表。
+
+## 2026-10-30 16:30 转折：自己写 HAL 插件（绕开 VirtualAudio）
+
+**为什么换路**：VirtualAudio 加载了却始终不打开我们的 `IOAudio2Device`（12 次重插、0 条 `opened by`），而且它的日志只进 unified log、我们解析不了。于是照 sheng 在 iPadOS 17 上的做法：**自己实现 HAL（AudioServerPlugIn）**，直接驱动内核里那台设备。
+
+**代码**：`hal/PandoraAudioPlugin.c`（约 900 行，纯 C）、`hal/Info.plist`、`hal/build.sh`、`.github/workflows/hal.yml`。
+CI（macos-14）编出 `arm64-apple-ios16.0` 的 `.driver`，adhoc 签名；产物 `pandora-hal.zip` 下发。
+插件通过 `dlsym(RTLD_DEFAULT)` 调 IOKit（无需链接），`StartIO` 时：找 `IOAudio2Device` 里 `device UID == "Speaker"` 的那台 →
+`IOServiceOpen` → 映射内存 type 0（引擎状态页）与 `0x10000001`（流 1 环形缓冲）→ method 0（engine start）+ method 6（set stream active）。
+`DoIOOperation(WriteMix)` 把 float32 转 s32 写进环形缓冲。诊断日志走 stderr，被 `sweetnull=mediaserverd` 转进内核日志（`|mediaserverd| PANDORA HAL: ...`）。
+
+**安装**：不刷镜像，走固件包的 `files.txt`（`bsd/dev/pandora_files.c` 支持 `- MODE PATH` 建目录、`NAME MODE PATH` 写文件）：
+```
+- 0755 /Library/Audio/Plug-Ins/HAL/PandoraAudio.driver
+PandoraAudio 0755 .../PandoraAudio.driver/PandoraAudio
+Info.plist  0644 .../PandoraAudio.driver/Info.plist
+CodeResources 0644 .../PandoraAudio.driver/_CodeSignature/CodeResources
+junk.bin 0755 /Library/Audio/Plug-Ins/HAL/VirtualAudio.plugin/VirtualAudio    ← 让 VirtualAudio 让位
+junk.bin 0755 /System/.../HAL/CarPlayHalogen.driver/CarPlayHalogen            ← 让 HAL 扫描能继续
+```
+
+**一路上踩的四个坑（都已在 CI/日志里验证）**：
+
+| # | 现象 | 原因 | 修法 |
+|---|---|---|---|
+| 1 | mediaserverd 扫到 bundle 但不加载 | iOS 的 HAL 插件是**根目录布局**（`Info.plist` 与可执行文件都在 bundle 根），不是 macOS 的 `Contents/MacOS` | 两种布局都放 |
+| 2 | factory 被调用，随后什么都没发生 | `QueryInterface` 必须回应 `kAudioServerPlugInDriverInterfaceUUID`（`eea5773d-…`），不是 `Info.plist` 里的 `kAudioServerPlugInTypeUUID` | 两个都接受 |
+| 3 | `plugin initialized` 之后 mediaserverd 立刻 SIGSEGV（`far 0x70` = 通过空指针取第 14 个方法槽） | `QueryInterface` 的 `outInterface` 要给**指向接口指针的指针**（宿主会解引用一层） | `*outInterface = &g_iface_ptr` |
+| 4 | `Initialize` 调了，但没有 `CreateDevice` | `HasProperty` 把缓冲区大小传成 0，导致**所有属性都被回答成"不存在"** | 用真实缓冲区大小 |
+
+**当前状态（h11）**：宿主已接受插件，`plugin initialized`，并开始遍历属性，40 条以内全部返回 0（成功）：
+
+```
+prop get id 1 clas/glob, id 1 dev#/glob   ← 插件类 + 设备列表
+prop get id 2 uid /glob, stm#/outp, stm#/inpt, nsrt, ring, saft, ltnc, tran
+prop get id 3 pfta, pft, schn, term
+prop get id 2 hidn/glob -> 2003332927     ← 'what'（未知属性），可选属性，正常
+```
+但**还没有 `CreateDevice`**（属性日志上限 40 条，后面的看不到）。下一次实验：把上限调大并把错误码打全，看宿主在哪一步放弃。
+
+**其它已验证的东西**（不重做）：ADSP 起来（`pandora_slot=a`）、播放图常驻（`spkgraph.bin`/`rcvgraph.bin`/`crus_calr.bin` 打包）、功放固件 7.30.1/27 算法、
+`/product/audio` 设备树节点、`pandora_pathlog=mediaserverd` 可看 HAL 插件加载过程。
