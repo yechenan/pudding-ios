@@ -30,9 +30,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-hdiutil attach -readonly -nobrowse -noverify -mountpoint "$mnt/os" "$os"
-hdiutil attach -readonly -nobrowse -noverify -mountpoint "$mnt/sys" "$sysos"
-hdiutil attach -readonly -nobrowse -noverify -mountpoint "$mnt/app" "$appos"
+hdiutil attach -readonly -owners on -nobrowse -noverify -mountpoint "$mnt/os" "$os"
+hdiutil attach -readonly -owners on -nobrowse -noverify -mountpoint "$mnt/sys" "$sysos"
+hdiutil attach -readonly -owners on -nobrowse -noverify -mountpoint "$mnt/app" "$appos"
 echo "mounted:"; ls "$mnt/os" | head; ls "$mnt/sys" | head -3; ls "$mnt/app" | head -3
 
 # A 16 GiB sparse file, formatted case-sensitive + journaled, then attached.
@@ -43,7 +43,7 @@ dev=$(hdiutil attach -nomount -imagekey diskimage-class=CRawDiskImage "$out" | h
 echo "raw device: $dev"
 newfs_hfs -s -J -v iOSRoot "$dev"
 hdiutil detach "$dev" >/dev/null
-hdiutil attach -imagekey diskimage-class=CRawDiskImage -nobrowse -mountpoint "$mnt/dst" "$out"
+hdiutil attach -imagekey diskimage-class=CRawDiskImage -owners on -nobrowse -mountpoint "$mnt/dst" "$out"
 
 # OS root: everything, symlinks and hard links preserved.
 sudo rsync -aH "$mnt/os/" "$mnt/dst/"          # macOS ships rsync 2.6.9: no --info
@@ -52,6 +52,11 @@ sudo rsync -aH "$mnt/os/" "$mnt/dst/"          # macOS ships rsync 2.6.9: no --i
 # and /System/Cryptexes/{OS,App} are symlinks into them (ios-fuxi's layout).
 sudo mkdir -p "$mnt/dst/private/preboot/Cryptexes/OS" "$mnt/dst/private/preboot/Cryptexes/App"
 sudo rsync -aH "$mnt/sys/" "$mnt/dst/private/preboot/Cryptexes/OS/"
+
+# hdiutil ignores ownership on disk images by default: the DMGs' files then look like the
+# runner's (uid 501) and rsync -a copies that owner. iOS refuses to map the dyld cache from
+# a file that is not root's ("owned by uid=501 instead of 0"), so put root ownership back.
+sudo chown -R 0:0 "$mnt/dst"
 sudo rsync -aH "$mnt/app/" "$mnt/dst/private/preboot/Cryptexes/App/"
 
 # dyld opens the shared cache by path: either /System/Library/Caches/com.apple.dyld/
